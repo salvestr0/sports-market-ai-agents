@@ -27,8 +27,8 @@ except ImportError:
 logger = logging.getLogger("agents.notifier")
 
 # Reuse same bot/chat as tg_bot.py
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "8552387840:AAF_zMGo4UYoJR4uHIvUrLg_WAoc_iP4CTw")
-CHAT_ID   = os.getenv("TG_CHAT_ID",   "403403270")
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+CHAT_ID   = os.getenv("TG_CHAT_ID",   "")
 
 
 def send(text: str) -> bool:
