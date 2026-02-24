@@ -1,0 +1,34 @@
+{
+  "_comment": "EXAMPLE FILE — replace with real picks. Bot reads all *.json files in this folder.",
+  "generated_at": "2026-02-18T10:00:00Z",
+  "picks": [
+    {
+      "event_id": "nba_celtics_lakers_20260218",
+      "sport": "basketball_nba",
+      "league": "NBA",
+      "home_team": "Boston Celtics",
+      "away_team": "Los Angeles Lakers",
+      "market_type": "moneyline",
+      "selection": "Boston Celtics",
+      "model_probability": 0.68,
+      "confidence": "high",
+      "notes": "Celtics 8-1 at home this month. Lakers missing AD and LeBron questionable.",
+      "event_start": "2026-02-19T00:30:00Z",
+      "polymarket_slug": ""
+    },
+    {
+      "event_id": "epl_arsenal_chelsea_20260222",
+      "sport": "soccer_epl",
+      "league": "EPL",
+      "home_team": "Arsenal",
+      "away_team": "Chelsea",
+      "market_type": "moneyline",
+      "selection": "Arsenal",
+      "model_probability": 0.57,
+      "confidence": "medium",
+      "notes": "Arsenal strong at home in EPL, Chelsea 3 losses in last 5.",
+      "event_start": "2026-02-22T14:00:00Z",
+      "polymarket_slug": ""
+    }
+  ]
+}

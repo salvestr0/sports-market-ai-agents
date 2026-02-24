@@ -1,0 +1,1545 @@
+"""
+Shared tools and agentic loop helper for the 4-agent sports betting pipeline.
+
+Tools available:
+  web_search(query, max_results)       — Tavily API w/ DuckDuckGo fallback
+  get_sharp_odds(sport, home, away)    — The Odds API devigged probabilities
+  get_polymarket_market(home, away)    — Polymarket Gamma API market lookup
+  get_nba_game_log(team_name)          — NBA Stats API last-N-games form (no key needed)
+  get_recent_results(sport, team_name) — Odds API scores: last 3 days, all sports (cached per sport)
+
+Utilities:
+  dispatch(name, input_data)      — Routes tool calls to Python functions
+  run_agent(...)                  — Anthropic agentic loop (tool_use → end_turn)
+  run_agent_gemini(...)           — Gemini agentic loop (Max / Nova / Lumi)
+  run_agent_grok(...)             — Grok agentic loop (Max breaking-news pre-pass)
+  extract_json(text)              — Robust JSON extractor from LLM text
+"""
+
+import os
+import json
+import time
+import difflib
+import logging
+import re
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+import openai
+from openai import OpenAI
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
+from cachetools import TTLCache
+
+logger = logging.getLogger("agents.tools")
+
+# ─── Agent identity + memory loader ──────────────────────────────────────────
+
+_AGENTS_DIR = Path(__file__).parent
+
+
+def load_agent_context(agent_name: str) -> str:
+    """
+    Load this agent's identity section from SOUL.md plus the full memory.md.
+
+    Injected at the top of each agent's user_prompt so the agent always
+    knows who it is and what the team has learned so far.
+
+    Args:
+        agent_name: "Max", "Nova", "Lumi", or "Sage"
+
+    Returns:
+        Formatted context string, or "" if files not found.
+    """
+    sections = []
+
+    # ── SOUL.md — extract shared principles + this agent's section ───────────
+    soul_path = _AGENTS_DIR / "SOUL.md"
+    if soul_path.exists():
+        soul_text = soul_path.read_text(encoding="utf-8")
+
+        # Always include the shared foundation
+        shared_start = soul_text.find("## Shared Foundation")
+        first_agent  = soul_text.find("\n## ", shared_start + 1)
+        shared_block = soul_text[shared_start:first_agent].strip() if first_agent > 0 else ""
+
+        # Extract this agent's own section
+        agent_header = f"## {agent_name} —"
+        agent_start  = soul_text.find(agent_header)
+        agent_end    = soul_text.find("\n## ", agent_start + 1)
+        if agent_start > 0:
+            agent_block = soul_text[agent_start: agent_end if agent_end > 0 else len(soul_text)].strip()
+        else:
+            agent_block = ""
+
+        soul_section = "\n\n".join(filter(None, [shared_block, agent_block]))
+        if soul_section:
+            sections.append(f"=== WHO YOU ARE ===\n{soul_section}")
+
+    # ── memory.md — settled knowledge ────────────────────────────────────────
+    memory_path = _AGENTS_DIR / "memory.md"
+    if memory_path.exists():
+        memory_text = memory_path.read_text(encoding="utf-8").strip()
+        if memory_text:
+            sections.append(f"=== TEAM MEMORY ===\n{memory_text}")
+
+    # ── BRAIN.md — live working memory ───────────────────────────────────────
+    brain_path = _AGENTS_DIR / "BRAIN.md"
+    if brain_path.exists():
+        brain_text = brain_path.read_text(encoding="utf-8").strip()
+        if brain_text:
+            sections.append(f"=== LIVE BRAIN (what we are currently tracking) ===\n{brain_text}")
+
+    # ── LEARNINGS.md — active rules from past mistakes ────────────────────────
+    learnings_path = _AGENTS_DIR / "LEARNINGS.md"
+    if learnings_path.exists():
+        learnings_text = learnings_path.read_text(encoding="utf-8").strip()
+        if learnings_text:
+            sections.append(f"=== LEARNINGS (rules from mistakes — follow these) ===\n{learnings_text}")
+
+    # ── HEARTBEAT.md — extract this agent's standing questions ───────────────
+    heartbeat_path = _AGENTS_DIR / "HEARTBEAT.md"
+    if heartbeat_path.exists():
+        hb_text = heartbeat_path.read_text(encoding="utf-8")
+
+        # Extract shared pulse + this agent's section
+        shared_start = hb_text.find("## Shared Pulse")
+        first_agent  = hb_text.find(f"\n## {agent_name}'s Heartbeat")
+        next_agent   = hb_text.find("\n## ", first_agent + 1) if first_agent > 0 else -1
+
+        shared_hb = hb_text[shared_start:first_agent].strip() if shared_start >= 0 and first_agent > 0 else ""
+        agent_hb  = hb_text[first_agent: next_agent if next_agent > 0 else len(hb_text)].strip() if first_agent > 0 else ""
+
+        hb_block = "\n\n".join(filter(None, [shared_hb, agent_hb]))
+        if hb_block:
+            sections.append(f"=== YOUR HEARTBEAT (ask yourself these every cycle) ===\n{hb_block}")
+
+    # ── SKILLS.md — extract this agent's capability section ─────────────────
+    skills_path = _AGENTS_DIR / "SKILLS.md"
+    if skills_path.exists():
+        sk_text = skills_path.read_text(encoding="utf-8")
+
+        skill_header = f"## {agent_name} —"
+        sk_start     = sk_text.find(skill_header)
+        sk_end       = sk_text.find("\n## ", sk_start + 1) if sk_start >= 0 else -1
+        agent_skills = sk_text[sk_start: sk_end if sk_end > 0 else len(sk_text)].strip() if sk_start >= 0 else ""
+
+        if agent_skills:
+            sections.append(f"=== YOUR SKILLS ===\n{agent_skills}")
+
+    return "\n\n".join(sections) + "\n\n" if sections else ""
+
+# ─── Tool Schemas (for Claude API) ───────────────────────────────────────────
+
+TOOL_WEB_SEARCH = {
+    "name": "web_search",
+    "description": (
+        "Search the web for sports news, injury reports, team form, match previews, "
+        "and upcoming event schedules. Returns a list of results with title and content."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query string",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum number of results to return (default 5)",
+                "default": 5,
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+TOOL_GET_SHARP_ODDS = {
+    "name": "get_sharp_odds",
+    "description": (
+        "Fetch devigged true probabilities from sharp sportsbooks (Pinnacle, Betfair) "
+        "for a specific matchup via The Odds API. Returns consensus home/away probabilities."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sport": {
+                "type": "string",
+                "description": "Odds API sport key, e.g. basketball_nba, americanfootball_nfl, soccer_epl",
+            },
+            "home_team": {"type": "string", "description": "Home team name"},
+            "away_team": {"type": "string", "description": "Away team name"},
+        },
+        "required": ["sport", "home_team", "away_team"],
+    },
+}
+
+TOOL_GET_POLYMARKET = {
+    "name": "get_polymarket_market",
+    "description": (
+        "Search Polymarket for an active market matching these teams. "
+        "Returns market slug, outcome prices, and volume if found."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "home_team": {"type": "string"},
+            "away_team": {"type": "string"},
+            "sport": {
+                "type": "string",
+                "description": "Sport key for context (optional)",
+                "default": "",
+            },
+        },
+        "required": ["home_team", "away_team"],
+    },
+}
+
+TOOL_GET_INJURIES = {
+    "name": "get_injury_report",
+    "description": (
+        "Fetch today's official injury report for a team from ESPN. "
+        "Returns a list of injured/questionable players with status and expected return date. "
+        "Use this for every team in every matchup you research."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "team_name": {
+                "type": "string",
+                "description": "Team name, e.g. 'Houston Rockets', 'Rockets', 'Lakers'",
+            },
+            "sport": {
+                "type": "string",
+                "description": "Sport key: basketball_nba | americanfootball_nfl | icehockey_nhl | baseball_mlb",
+            },
+        },
+        "required": ["team_name", "sport"],
+    },
+}
+
+TOOL_GET_NBA_GAME_LOG = {
+    "name": "get_nba_game_log",
+    "description": (
+        "Fetch the last N NBA game results for a team from the official NBA Stats API. "
+        "Returns structured form data: date, opponent, home/away, W/L, points scored. "
+        "Use this for ALL NBA recent form — one call per team, faster and more reliable than web_search. "
+        "NBA only — for EPL/UCL/MMA/NFL form, use web_search instead."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "team_name": {
+                "type": "string",
+                "description": "NBA team name, e.g. 'Houston Rockets', 'Rockets', 'Lakers'",
+            },
+            "num_games": {
+                "type": "integer",
+                "description": "Number of recent games to return (default 5)",
+                "default": 5,
+            },
+        },
+        "required": ["team_name"],
+    },
+}
+
+TOOL_GET_RECENT_RESULTS = {
+    "name": "get_recent_results",
+    "description": (
+        "Fetch recent completed game results for a team from The Odds API scores endpoint. "
+        "Covers all sports: EPL, UCL, MMA, NFL, NHL, MLB (and NBA — but prefer get_nba_game_log for NBA). "
+        "Returns date, home team, away team, final score. Looks back up to 3 days. "
+        "Results for the same sport are cached — calling it for both teams in a matchup "
+        "only costs one API request. Fall back to web_search if 0 results returned."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sport": {
+                "type": "string",
+                "description": (
+                    "Odds API sport key: soccer_epl | soccer_uefa_champs_league | "
+                    "mma_mixed_martial_arts | americanfootball_nfl | icehockey_nhl | baseball_mlb"
+                ),
+            },
+            "team_name": {
+                "type": "string",
+                "description": "Team or fighter name to filter results for",
+            },
+            "num_games": {
+                "type": "integer",
+                "description": "Max results to return (default 3)",
+                "default": 3,
+            },
+        },
+        "required": ["sport", "team_name"],
+    },
+}
+
+
+# ─── Name matching ─────────────────────────────────────────────────────────────
+
+def _names_match(a: str, b: str, threshold: float = 0.6) -> bool:
+    """
+    Fuzzy team name match. Handles short vs full names:
+    "Rockets" matches "Houston Rockets", "76ers" matches "Philadelphia 76ers".
+    """
+    a, b = a.lower().strip(), b.lower().strip()
+    if a == b:
+        return True
+    # Substring containment (handles "Rockets" ↔ "Houston Rockets")
+    if a in b or b in a:
+        return True
+    # Last-word match (team nickname without city)
+    a_last = a.split()[-1] if a.split() else a
+    b_last = b.split()[-1] if b.split() else b
+    if len(a_last) > 3 and a_last == b_last:
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= threshold
+
+
+# ─── web_search ───────────────────────────────────────────────────────────────
+
+def web_search(query: str, max_results: int = 5) -> list:
+    """Search the web. Uses Tavily if TAVILY_API_KEY is set, else DuckDuckGo."""
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if api_key:
+        results = _tavily_search(query, max_results, api_key)
+        if results:
+            return results
+        logger.debug("[TOOLS] Tavily failed, falling back to DuckDuckGo")
+    else:
+        logger.debug("[TOOLS] TAVILY_API_KEY not set, using DuckDuckGo")
+    return _ddg_search(query, max_results)
+
+
+def _tavily_search(query: str, max_results: int, api_key: str) -> list:
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json={"api_key": api_key, "query": query, "max_results": max_results},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for item in data.get("results", [])[:max_results]:
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "content": (item.get("content", "") or "")[:600],
+            })
+        return results
+    except Exception as e:
+        logger.debug(f"[TOOLS] Tavily error: {e}")
+        return []
+
+
+def _ddg_search(query: str, max_results: int) -> list:
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        # Session + homepage warmup avoids DuckDuckGo's 202 challenge response
+        session = requests.Session()
+        session.get("https://duckduckgo.com/", headers=headers, timeout=10)
+        time.sleep(0.5)
+        r = session.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers=headers,
+            timeout=12,
+        )
+        if r.status_code != 200:
+            logger.debug(f"[TOOLS] DDG returned status {r.status_code}")
+            return []
+        clean = lambda s: re.sub(r"<[^>]+>", "", s).strip()
+        titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', r.text, re.DOTALL)
+        # DDG uses <a class="result__snippet"> — closes with </a>
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', r.text, re.DOTALL)
+        results = []
+        for i in range(min(max_results, len(titles))):
+            results.append({
+                "title": clean(titles[i]),
+                "url": "",
+                "content": clean(snippets[i]) if i < len(snippets) else "",
+            })
+        return results
+    except Exception as e:
+        logger.debug(f"[TOOLS] DuckDuckGo fallback failed: {e}")
+        return [{"title": "Search unavailable", "url": "", "content": f"Error: {e}"}]
+
+
+# ─── get_nba_game_log ────────────────────────────────────────────────────────
+
+_NBA_TEAM_IDS = {
+    "atlanta hawks": 1610612737,      "hawks": 1610612737,
+    "boston celtics": 1610612738,     "celtics": 1610612738,
+    "brooklyn nets": 1610612751,      "nets": 1610612751,
+    "charlotte hornets": 1610612766,  "hornets": 1610612766,
+    "chicago bulls": 1610612741,      "bulls": 1610612741,
+    "cleveland cavaliers": 1610612739,"cavaliers": 1610612739, "cavs": 1610612739,
+    "dallas mavericks": 1610612742,   "mavericks": 1610612742, "mavs": 1610612742,
+    "denver nuggets": 1610612743,     "nuggets": 1610612743,
+    "detroit pistons": 1610612765,    "pistons": 1610612765,
+    "golden state warriors": 1610612744, "warriors": 1610612744,
+    "houston rockets": 1610612745,    "rockets": 1610612745,
+    "indiana pacers": 1610612754,     "pacers": 1610612754,
+    "los angeles clippers": 1610612746, "clippers": 1610612746, "la clippers": 1610612746,
+    "los angeles lakers": 1610612747, "lakers": 1610612747,    "la lakers": 1610612747,
+    "memphis grizzlies": 1610612763,  "grizzlies": 1610612763,
+    "miami heat": 1610612748,         "heat": 1610612748,
+    "milwaukee bucks": 1610612749,    "bucks": 1610612749,
+    "minnesota timberwolves": 1610612750, "timberwolves": 1610612750, "wolves": 1610612750,
+    "new orleans pelicans": 1610612740, "pelicans": 1610612740,
+    "new york knicks": 1610612752,    "knicks": 1610612752,
+    "oklahoma city thunder": 1610612760, "thunder": 1610612760, "okc": 1610612760,
+    "orlando magic": 1610612753,      "magic": 1610612753,
+    "philadelphia 76ers": 1610612755, "76ers": 1610612755,     "sixers": 1610612755,
+    "phoenix suns": 1610612756,       "suns": 1610612756,
+    "portland trail blazers": 1610612757, "trail blazers": 1610612757, "blazers": 1610612757,
+    "sacramento kings": 1610612758,   "kings": 1610612758,
+    "san antonio spurs": 1610612759,  "spurs": 1610612759,
+    "toronto raptors": 1610612761,    "raptors": 1610612761,
+    "utah jazz": 1610612762,          "jazz": 1610612762,
+    "washington wizards": 1610612764, "wizards": 1610612764,
+}
+
+
+def _get_nba_season() -> str:
+    """Returns current NBA season string, e.g. '2025-26'. Season starts in October."""
+    now = datetime.now(timezone.utc)
+    year = now.year
+    if now.month < 10:
+        return f"{year - 1}-{str(year)[2:]}"
+    return f"{year}-{str(year + 1)[2:]}"
+
+
+def get_nba_game_log(team_name: str, num_games: int = 5) -> dict:
+    """
+    Fetch last N completed game results for an NBA team from the official NBA Stats API.
+    Returns structured form data: date, opponent, home/away, W/L, points.
+    No API key required — free public endpoint.
+    """
+    team_key = team_name.lower().strip()
+    team_id = _NBA_TEAM_IDS.get(team_key)
+
+    if not team_id:
+        # Fuzzy fallback
+        for name, tid in _NBA_TEAM_IDS.items():
+            if _names_match(team_key, name):
+                team_id = tid
+                break
+
+    if not team_id:
+        return {"found": False, "error": f"Unknown NBA team: {team_name!r}"}
+
+    season = _get_nba_season()
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://stats.nba.com",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://stats.nba.com",
+        "x-nba-stats-origin": "stats",
+        "x-nba-stats-token": "true",
+    }
+
+    try:
+        r = requests.get(
+            "https://stats.nba.com/stats/teamgamelog",
+            params={
+                "TeamID": team_id,
+                "Season": season,
+                "SeasonType": "Regular Season",
+                "LeagueID": "00",
+            },
+            headers=headers,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.debug(f"[TOOLS] NBA game log failed for {team_name}: {e}")
+        return {"found": False, "error": str(e)}
+
+    result_sets = data.get("resultSets", [])
+    if not result_sets:
+        return {"found": False, "error": "Empty NBA API response"}
+
+    col_headers = result_sets[0].get("headers", [])
+    rows = result_sets[0].get("rowSet", [])
+    if not rows:
+        return {"found": False, "error": "No game log rows returned"}
+
+    try:
+        idx_date    = col_headers.index("GAME_DATE")
+        idx_matchup = col_headers.index("MATCHUP")
+        idx_wl      = col_headers.index("WL")
+        idx_pts     = col_headers.index("PTS")
+    except ValueError as e:
+        return {"found": False, "error": f"Unexpected API columns: {e}"}
+
+    games = []
+    for row in rows[:num_games]:
+        matchup   = row[idx_matchup]  # e.g. "HOU vs. LAL" or "HOU @ LAL"
+        is_home   = " vs. " in matchup
+        opponent  = matchup.split(" vs. ")[-1] if is_home else matchup.split(" @ ")[-1]
+        games.append({
+            "date":       row[idx_date],
+            "matchup":    matchup,
+            "home_away":  "home" if is_home else "away",
+            "opponent":   opponent.strip(),
+            "result":     row[idx_wl],
+            "pts_scored": row[idx_pts],
+        })
+
+    wins   = sum(1 for g in games if g["result"] == "W")
+    losses = len(games) - wins
+    return {
+        "found":         True,
+        "team":          team_name,
+        "season":        season,
+        "record_last_n": f"{wins}W-{losses}L",
+        "games":         games,
+    }
+
+
+# ─── get_recent_results ──────────────────────────────────────────────────────
+
+def get_recent_results(sport: str, team_name: str, num_games: int = 3) -> dict:
+    """
+    Fetch recent completed game results for a team from The Odds API scores endpoint.
+    Results per sport are cached (30-minute TTL) — multiple team lookups in the same
+    sport only cost one API request, and results survive across consecutive batches.
+    """
+    api_key = os.getenv("ODDS_API_KEY", "")
+    if not api_key:
+        return {"found": False, "error": "ODDS_API_KEY not configured"}
+
+    # ── Fetch (or reuse cached) all results for this sport ───────────────────
+    with _scores_cache_lock:
+        all_events = _scores_cache.get(sport)
+
+    if all_events is None:
+        try:
+            r = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/{sport}/scores/",
+                params={"apiKey": api_key, "daysFrom": 3, "dateFormat": "iso"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            all_events = r.json()
+            with _scores_cache_lock:
+                _scores_cache[sport] = all_events
+            logger.debug(f"[TOOLS] Scores cache populated for {sport}: {len(all_events)} events")
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response else 0
+            if code == 422:
+                return {"found": False, "error": f"Sport '{sport}' not available on scores endpoint"}
+            return {"found": False, "error": str(e)}
+        except Exception as e:
+            return {"found": False, "error": str(e)}
+    else:
+        logger.debug(f"[TOOLS] Scores cache hit for {sport}")
+
+    # ── Filter to completed games involving this team ────────────────────────
+    matches = []
+    for event in all_events:
+        if not event.get("completed"):
+            continue
+        home = event.get("home_team", "")
+        away = event.get("away_team", "")
+        if not (_names_match(team_name, home) or _names_match(team_name, away)):
+            continue
+
+        scores = event.get("scores") or []
+        score_map = {s["name"]: s["score"] for s in scores if s.get("name") and s.get("score")}
+        home_score = score_map.get(home, "?")
+        away_score = score_map.get(away, "?")
+
+        # Determine result from this team's perspective
+        try:
+            h = float(home_score)
+            a = float(away_score)
+            team_is_home = _names_match(team_name, home)
+            team_score = h if team_is_home else a
+            opp_score  = a if team_is_home else h
+            result = "W" if team_score > opp_score else ("L" if team_score < opp_score else "D")
+        except (ValueError, TypeError):
+            result = "?"
+            team_is_home = _names_match(team_name, home)
+
+        opponent = away if _names_match(team_name, home) else home
+        matches.append({
+            "date":       event.get("commence_time", "")[:10],
+            "home_team":  home,
+            "away_team":  away,
+            "score":      f"{home_score}-{away_score}",
+            "home_away":  "home" if team_is_home else "away",
+            "opponent":   opponent,
+            "result":     result,
+        })
+
+    # Most recent first
+    matches.sort(key=lambda x: x["date"], reverse=True)
+    matches = matches[:num_games]
+
+    if not matches:
+        return {
+            "found": False,
+            "message": (
+                f"No completed results for {team_name!r} in the past 3 days. "
+                "Use web_search for longer-term form."
+            ),
+        }
+
+    wins   = sum(1 for m in matches if m["result"] == "W")
+    losses = sum(1 for m in matches if m["result"] == "L")
+    draws  = sum(1 for m in matches if m["result"] == "D")
+    record = f"{wins}W-{losses}L" + (f"-{draws}D" if draws else "")
+
+    return {
+        "found":         True,
+        "team":          team_name,
+        "sport":         sport,
+        "record_last_n": record,
+        "results":       matches,
+        "note":          "3-day window only — use web_search for full 5-game form history",
+    }
+
+
+# ─── get_sharp_odds ──────────────────────────────────────────────────────────
+
+SHARP_BOOKS = ["pinnacle", "betfair_ex_eu", "betfair_ex_au", "sport888", "draftkings", "fanduel"]
+
+
+def get_sharp_odds(sport: str, home_team: str, away_team: str) -> dict:
+    """Fetch devigged sharp book probabilities for a matchup."""
+    api_key = os.getenv("ODDS_API_KEY", "")
+    if not api_key:
+        return {"error": "ODDS_API_KEY not configured", "found": False, "books": []}
+
+    try:
+        r = requests.get(
+            f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
+            params={
+                "apiKey": api_key,
+                "regions": "us,uk,eu,au",
+                "markets": "h2h",
+                "oddsFormat": "decimal",
+                "bookmakers": ",".join(SHARP_BOOKS),
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        events = r.json()
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response else 0
+        if code == 422:
+            return {"error": f"Sport '{sport}' not available", "found": False, "books": []}
+        return {"error": str(e), "found": False, "books": []}
+    except Exception as e:
+        return {"error": str(e), "found": False, "books": []}
+
+    # Find matching event
+    target = None
+    swapped = False
+    for event in events:
+        h = event.get("home_team", "")
+        a = event.get("away_team", "")
+        if _names_match(h, home_team) and _names_match(a, away_team):
+            target = event
+            break
+        if _names_match(a, home_team) and _names_match(h, away_team):
+            target = event
+            swapped = True
+            break
+
+    if not target:
+        return {
+            "found": False,
+            "message": f"No event found for {home_team} vs {away_team} in {sport}",
+            "books": [],
+        }
+
+    actual_home = target["away_team"] if swapped else target["home_team"]
+    actual_away = target["home_team"] if swapped else target["away_team"]
+
+    # Parse odds per book
+    books = []
+    for bm in target.get("bookmakers", []):
+        for market in bm.get("markets", []):
+            if market.get("key") != "h2h":
+                continue
+            outcomes = market.get("outcomes", [])
+            raw_probs = [1.0 / o["price"] for o in outcomes if o.get("price", 0) > 0]
+            total_raw = sum(raw_probs)
+            if total_raw <= 0:
+                continue
+            probs = {}
+            for outcome in outcomes:
+                if outcome.get("price", 0) <= 0:
+                    continue
+                probs[outcome["name"]] = round((1.0 / outcome["price"]) / total_raw, 4)
+            books.append({"book": bm["key"], "probs": probs})
+
+    if not books:
+        return {
+            "found": True,
+            "event_id": target["id"],
+            "home_team": actual_home,
+            "away_team": actual_away,
+            "commence_time": target.get("commence_time", ""),
+            "message": "Event found but no sharp book odds available",
+            "books": [],
+        }
+
+    # Consensus: average across books
+    home_probs = [b["probs"].get(actual_home, 0) for b in books if actual_home in b["probs"]]
+    away_probs = [b["probs"].get(actual_away, 0) for b in books if actual_away in b["probs"]]
+
+    # If exact name doesn't match, try fuzzy
+    if not home_probs:
+        for b in books:
+            for name, prob in b["probs"].items():
+                if _names_match(name, actual_home, 0.5):
+                    home_probs.append(prob)
+                elif _names_match(name, actual_away, 0.5):
+                    away_probs.append(prob)
+
+    home_consensus = round(sum(home_probs) / len(home_probs), 4) if home_probs else 0.0
+    away_consensus = round(sum(away_probs) / len(away_probs), 4) if away_probs else 0.0
+
+    return {
+        "found": True,
+        "event_id": target["id"],
+        "home_team": actual_home,
+        "away_team": actual_away,
+        "commence_time": target.get("commence_time", ""),
+        "books": books,
+        "consensus": {
+            "home_team": actual_home,
+            "away_team": actual_away,
+            "home_prob": home_consensus,
+            "away_prob": away_consensus,
+            "books_used": len(books),
+        },
+    }
+
+
+# ─── get_polymarket_market ────────────────────────────────────────────────────
+
+def get_polymarket_market(home_team: str, away_team: str, sport: str = "") -> dict:
+    """Search Polymarket Gamma API for an active market matching these teams."""
+    base = "https://gamma-api.polymarket.com"
+    session = requests.Session()
+    session.headers["User-Agent"] = "SportsBettingBot/1.0"
+
+    search_terms = [
+        f"{home_team} {away_team}",
+        home_team,
+        away_team,
+    ]
+
+    for term in search_terms:
+        try:
+            r = session.get(
+                f"{base}/markets",
+                params={"q": term, "limit": 10, "active": "true", "closed": "false"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            markets = r.json()
+
+            for m in markets:
+                # Parse prices
+                prices_raw = m.get("outcomePrices", "")
+                if isinstance(prices_raw, str):
+                    try:
+                        prices_raw = json.loads(prices_raw)
+                    except Exception:
+                        continue
+                prices = [float(p) for p in prices_raw] if prices_raw else []
+                if not prices:
+                    continue
+
+                # Parse outcomes
+                outcomes_raw = m.get("outcomes", "")
+                if isinstance(outcomes_raw, str):
+                    try:
+                        outcomes = json.loads(outcomes_raw)
+                    except Exception:
+                        outcomes = ["Yes", "No"]
+                elif isinstance(outcomes_raw, list):
+                    outcomes = outcomes_raw
+                else:
+                    outcomes = ["Yes", "No"]
+
+                # Check if teams appear in question
+                q = m.get("question", "").lower()
+                h_tokens = [t for t in home_team.lower().split() if len(t) > 3]
+                a_tokens = [t for t in away_team.lower().split() if len(t) > 3]
+                home_match = any(t in q for t in h_tokens)
+                away_match = any(t in q for t in a_tokens)
+                if not (home_match or away_match):
+                    continue
+
+                # Find home/away prices by outcome name matching
+                home_price = None
+                away_price = None
+                for i, outcome in enumerate(outcomes):
+                    if i >= len(prices):
+                        break
+                    if _names_match(outcome, home_team, 0.45):
+                        home_price = prices[i]
+                    elif _names_match(outcome, away_team, 0.45):
+                        away_price = prices[i]
+
+                return {
+                    "found": True,
+                    "slug": m.get("slug", ""),
+                    "question": m.get("question", ""),
+                    "outcomes": outcomes,
+                    "prices": prices,
+                    "home_price": home_price,
+                    "away_price": away_price,
+                    "volume": float(m.get("volume", 0) or 0),
+                }
+
+            time.sleep(0.2)
+        except Exception as e:
+            logger.debug(f"[TOOLS] Polymarket search failed for '{term}': {e}")
+
+    return {
+        "found": False,
+        "message": f"No active Polymarket market found for {home_team} vs {away_team}",
+    }
+
+
+# ─── fetch_polymarket_events ──────────────────────────────────────────────────
+
+# Polymarket tag IDs per sport (from GET /sports endpoint)
+_SPORT_TAGS = {
+    "NBA":   "745",
+    "NFL":   "450",
+    "EPL":   "82",
+    "NHL":   "899",
+    "MLB":   "100381",
+    "MMA":   "100639",   # generic sports tag — catches UFC/boxing/etc.
+    "UCL":   "306",      # UEFA Champions League
+}
+
+
+def fetch_polymarket_events(hours_ahead: int = 48) -> list:
+    """
+    Fetch all upcoming sports events from Polymarket's Gamma API.
+
+    Uses the /events endpoint with sport-specific tag IDs — the only reliable
+    way to find individual game markets (moneyline, spread) as opposed to
+    season-long futures. Verified to surface e.g. Rockets vs. Hornets.
+
+    Returns a list of dicts sorted by volume (highest first). Each dict:
+      league, title, end_date, team_a, team_b, markets (list of market dicts),
+      total_volume, moneyline_prices (dict team→price), slug
+    """
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(hours=hours_ahead)
+
+    all_events = []
+    seen_titles = set()
+
+    for league, tag_id in _SPORT_TAGS.items():
+        try:
+            r = requests.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"tag_id": tag_id, "limit": 100, "active": "true", "closed": "false"},
+                headers={"User-Agent": "SportsBettingBot/1.0"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            raw_events = r.json()
+        except Exception as e:
+            logger.debug(f"[TOOLS] fetch_polymarket_events: {league} fetch failed: {e}")
+            continue
+
+        for e in raw_events:
+            title = e.get("title", "")
+            end_str = e.get("endDate", "")
+
+            # Skip dupes (same event can appear under multiple tags)
+            if title in seen_titles:
+                continue
+
+            # Timing filter: skip past events and far-future (futures/season markets)
+            if end_str:
+                try:
+                    end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                    if end_dt < now:
+                        continue
+                    if end_dt > cutoff:
+                        continue
+                except Exception:
+                    pass
+            else:
+                continue  # no date = skip
+
+            seen_titles.add(title)
+            markets_raw = e.get("markets", [])
+
+            # Aggregate volume across all markets in this event
+            total_vol = sum(float(m.get("volume", 0) or 0) for m in markets_raw)
+
+            # Find the moneyline (h2h) market — the one with exactly 2 outcomes (team names)
+            moneyline = None
+            moneyline_prices = {}
+            slug = ""
+            for m in markets_raw:
+                outs_raw = m.get("outcomes", "[]")
+                if isinstance(outs_raw, str):
+                    try:
+                        outs = json.loads(outs_raw)
+                    except Exception:
+                        continue
+                else:
+                    outs = outs_raw
+
+                prices_raw = m.get("outcomePrices", "[]")
+                if isinstance(prices_raw, str):
+                    try:
+                        prices_list = [float(p) for p in json.loads(prices_raw)]
+                    except Exception:
+                        continue
+                else:
+                    prices_list = [float(p) for p in prices_raw]
+
+                if len(outs) == 2 and len(prices_list) == 2:
+                    # Simple team vs team = moneyline
+                    q_lower = m.get("question", "").lower()
+                    if "spread" not in q_lower and "o/u" not in q_lower and "over" not in q_lower:
+                        moneyline = m
+                        moneyline_prices = dict(zip(outs, prices_list))
+                        slug = m.get("slug", "")
+                        break
+
+            if not moneyline_prices and markets_raw:
+                # Fallback: just use first market's outcomes
+                m0 = markets_raw[0]
+                outs_raw = m0.get("outcomes", "[]")
+                if isinstance(outs_raw, str):
+                    try:
+                        outs = json.loads(outs_raw)
+                    except Exception:
+                        outs = []
+                else:
+                    outs = outs_raw
+                prices_raw = m0.get("outcomePrices", "[]")
+                if isinstance(prices_raw, str):
+                    try:
+                        pl = [float(p) for p in json.loads(prices_raw)]
+                    except Exception:
+                        pl = []
+                else:
+                    pl = [float(p) for p in prices_raw]
+                moneyline_prices = dict(zip(outs, pl))
+                slug = m0.get("slug", "")
+
+            teams = list(moneyline_prices.keys())
+            event_dict = {
+                "league":           league,
+                "title":            title,
+                "end_date":         end_str[:16],
+                "team_a":           teams[0] if len(teams) > 0 else "",
+                "team_b":           teams[1] if len(teams) > 1 else "",
+                "moneyline_prices": moneyline_prices,
+                "total_volume":     total_vol,
+                "slug":             slug,
+                "markets":          markets_raw,
+            }
+            all_events.append(event_dict)
+
+    # Sort by total volume — highest volume = most important game
+    all_events.sort(key=lambda x: x["total_volume"], reverse=True)
+    logger.info(f"[TOOLS] fetch_polymarket_events: {len(all_events)} upcoming games found")
+    return all_events
+
+
+# ─── get_injury_report ────────────────────────────────────────────────────────
+
+# Session-level player→team cache for cross-call corruption detection.
+# Maps player_name → first team_name that claimed them this batch.
+# Reset at the start of each runner batch via reset_injury_session().
+_injury_session: dict = {}
+
+# Scores cache: sport_key → list of raw event dicts from Odds API.
+# TTLCache with 30-minute expiry — survives across batch boundaries to reduce
+# API quota usage when the same sport is requested in consecutive batches.
+_scores_cache: TTLCache = TTLCache(maxsize=32, ttl=1800)
+_scores_cache_lock = threading.RLock()
+
+
+def reset_injury_session() -> None:
+    """Call at the start of each batch to clear the cross-call corruption tracker."""
+    global _injury_session
+    _injury_session = {}
+    logger.debug("[get_injury_report] Injury session cache reset")
+
+
+_ESPN_SPORT_MAP = {
+    "basketball_nba":          ("basketball", "nba"),
+    "americanfootball_nfl":    ("football",   "nfl"),
+    "icehockey_nhl":           ("hockey",     "nhl"),
+    "baseball_mlb":            ("baseball",   "mlb"),
+    "americanfootball_ncaaf":  ("football",   "college-football"),
+    "basketball_ncaab":        ("basketball", "mens-college-basketball"),
+}
+
+
+def get_injury_report(team_name: str, sport: str = "basketball_nba") -> dict:
+    """
+    Fetch today's injury report for a team from ESPN's public API.
+    Returns a structured list of injured/questionable players.
+    """
+    espn_sport, espn_league = _ESPN_SPORT_MAP.get(sport, ("basketball", "nba"))
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{espn_sport}/{espn_league}/injuries"
+
+    try:
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return {"team": team_name, "found": False, "error": str(e), "players": []}
+
+    team_name_lower = team_name.lower().strip()
+    matched_team = None
+
+    for team_entry in data.get("injuries", []):
+        # ESPN API now puts team name at the top level of each entry, not inside team{}
+        t_name = (
+            team_entry.get("displayName")
+            or team_entry.get("shortDisplayName")
+            or team_entry.get("team", {}).get("displayName")  # legacy fallback
+            or ""
+        )
+        if t_name and _names_match(team_name_lower, t_name.lower()):
+            matched_team = team_entry
+            break
+
+    if not matched_team:
+        # ESPN only lists teams WITH active injuries. A missing team = clean bill of health.
+        logger.debug(f"[get_injury_report] '{team_name}' not in ESPN report — no injuries on record")
+        return {
+            "team": team_name,
+            "found": True,
+            "players": [],
+            "summary": "0 OUT, 0 Questionable",
+            "message": "No injuries on record — team not listed in ESPN injury report (clean bill of health).",
+        }
+
+    # Resolve the canonical ESPN team name once — used for caching below
+    espn_team_name = (
+        matched_team.get("displayName")
+        or matched_team.get("team", {}).get("displayName")
+        or team_name
+    )
+
+    players = []
+    for injury in matched_team.get("injuries", []):
+        athlete = injury.get("athlete", {})
+        details = injury.get("details", {})
+        players.append({
+            "name":        athlete.get("displayName", "?"),
+            "position":    athlete.get("position", {}).get("abbreviation", "?"),
+            "status":      injury.get("status", "?"),
+            "injury_type": details.get("type", "?"),
+            "return_date": details.get("returnDate", "unknown"),
+        })
+
+    # Sort by impact: Out first, then Questionable, then rest
+    status_order = {"Out": 0, "Doubtful": 1, "Questionable": 2, "Probable": 3}
+    players.sort(key=lambda p: status_order.get(p["status"], 9))
+
+    # ── Corruption check ─────────────────────────────────────────────────────
+    # Cache key is the resolved ESPN team name, NOT the raw query string.
+    # This prevents "Wizards" and "Washington Wizards" from flagging each other
+    # as corruption since they both resolve to "Washington Wizards".
+    cross_team_dupes = [
+        p["name"] for p in players
+        if p["name"] in _injury_session and _injury_session[p["name"]] != espn_team_name
+    ]
+    if len(cross_team_dupes) >= 2:
+        logger.warning(
+            f"[get_injury_report] Corrupt data for '{team_name}' — "
+            f"{cross_team_dupes[:3]} already seen for other teams. Skipping."
+        )
+        return {
+            "team": team_name,
+            "found": False,
+            "error": "corrupted_data",
+            "players": [],
+            "message": (
+                f"Injury data appears corrupted — {cross_team_dupes[0]} and "
+                f"{len(cross_team_dupes)-1} other(s) already appeared for different teams. "
+                "Use web search for injury information instead."
+            ),
+        }
+
+    # Cache by resolved ESPN name so aliases ("Wizards"/"Washington Wizards") share the same key
+    for p in players:
+        _injury_session.setdefault(p["name"], espn_team_name)
+
+    return {
+        "team":    espn_team_name,
+        "found":   True,
+        "players": players,
+        "summary": f"{sum(1 for p in players if p['status']=='Out')} OUT, "
+                   f"{sum(1 for p in players if p['status']=='Questionable')} Questionable",
+    }
+
+
+# ─── Tool dispatcher ──────────────────────────────────────────────────────────
+
+def dispatch(name: str, input_data: dict) -> dict:
+    """Route an agent tool call to the appropriate Python function."""
+    if name == "web_search":
+        results = web_search(
+            query=input_data.get("query", ""),
+            max_results=input_data.get("max_results", 5),
+        )
+        return {"results": results, "count": len(results)}
+    elif name == "get_sharp_odds":
+        return get_sharp_odds(
+            sport=input_data.get("sport", ""),
+            home_team=input_data.get("home_team", ""),
+            away_team=input_data.get("away_team", ""),
+        )
+    elif name == "get_polymarket_market":
+        return get_polymarket_market(
+            home_team=input_data.get("home_team", ""),
+            away_team=input_data.get("away_team", ""),
+            sport=input_data.get("sport", ""),
+        )
+    elif name == "get_injury_report":
+        return get_injury_report(
+            team_name=input_data.get("team_name", ""),
+            sport=input_data.get("sport", "basketball_nba"),
+        )
+    elif name == "get_nba_game_log":
+        return get_nba_game_log(
+            team_name=input_data.get("team_name", ""),
+            num_games=input_data.get("num_games", 5),
+        )
+    elif name == "get_recent_results":
+        return get_recent_results(
+            sport=input_data.get("sport", ""),
+            team_name=input_data.get("team_name", ""),
+            num_games=input_data.get("num_games", 3),
+        )
+    else:
+        return {"error": f"Unknown tool: {name}"}
+
+
+# ─── Agentic loop ─────────────────────────────────────────────────────────────
+
+def _api_call_with_retry(client, **kwargs):
+    """
+    Retry wrapper for Anthropic API calls.
+    Retries on transient server errors (500, 529 overloaded, network failures).
+    Fails immediately on client errors (4xx) — those won't fix themselves.
+    Backoff: 5s → 15s → 30s → 60s → 120s (6 attempts total, ~4 min total wait).
+    """
+    delays = [5, 15, 30, 60, 120]
+    max_attempts = len(delays) + 1  # 6
+    for attempt in range(max_attempts):
+        try:
+            return client.messages.create(**kwargs)
+        except Exception as e:
+            # Determine if this error is worth retrying
+            status = getattr(e, "status_code", None)
+            is_transient = (
+                status in (500, 529, 503, 408)  # server-side / overloaded / timeout
+                or status is None               # network-level error (no HTTP status)
+            )
+            if not is_transient:
+                raise  # 400/401/403/404 etc — won't fix on retry
+
+            if attempt < max_attempts - 1:
+                delay = delays[attempt]
+                logger.warning(
+                    f"[AGENT] Anthropic API error (attempt {attempt + 1}/{max_attempts}, "
+                    f"status={status}): {e} — retrying in {delay}s"
+                )
+                time.sleep(delay)
+            else:
+                logger.error(f"[AGENT] Anthropic API failed after {max_attempts} attempts: {e}")
+                raise
+
+
+def run_agent(
+    client,
+    model: str,
+    system: str,
+    user_prompt: str,
+    tools_schema: list = None,
+    execute_fn=None,
+    max_tool_calls: int = 15,
+) -> str:
+    """
+    Run an agentic loop until stop_reason is end_turn or max_tool_calls is reached.
+    Returns the final text from Claude.
+
+    If tools_schema is empty/None, makes a single completion call (no loop).
+    """
+    messages = [{"role": "user", "content": user_prompt}]
+    tool_calls_used = 0
+    last_response = None
+
+    while True:
+        use_tools = (tools_schema or []) if tool_calls_used < max_tool_calls else []
+
+        kwargs = {
+            "model": model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": messages,
+        }
+        if use_tools:
+            kwargs["tools"] = use_tools
+
+        last_response = _api_call_with_retry(client, **kwargs)
+
+        if last_response.stop_reason != "tool_use" or not use_tools:
+            break
+
+        # Extract and execute tool calls
+        tool_use_blocks = [b for b in last_response.content if b.type == "tool_use"]
+        tool_calls_used += len(tool_use_blocks)
+
+        messages.append({"role": "assistant", "content": last_response.content})
+
+        tool_results = []
+        for block in tool_use_blocks:
+            try:
+                fn = execute_fn or dispatch
+                result = fn(block.name, block.input)
+            except Exception as e:
+                result = {"error": str(e)}
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": json.dumps(result, default=str),
+            })
+
+        messages.append({"role": "user", "content": tool_results})
+
+        if tool_calls_used >= max_tool_calls:
+            logger.warning(f"[AGENT] Tool cap ({max_tool_calls}) reached — forcing final response")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "IMPORTANT: You have used the maximum number of tool calls. "
+                    "Please output your final JSON analysis now based on what you have gathered."
+                ),
+            })
+
+    # Extract text from final response
+    if last_response:
+        for block in last_response.content:
+            if hasattr(block, "text"):
+                return block.text
+    return ""
+
+
+# ─── OpenAI-compatible tool schema helper ────────────────────────────────────
+
+def _to_openai_tool(schema: dict) -> dict:
+    """Convert an Anthropic-format tool schema to OpenAI function-calling format."""
+    return {
+        "type": "function",
+        "function": {
+            "name": schema["name"],
+            "description": schema.get("description", ""),
+            "parameters": schema["input_schema"],
+        },
+    }
+
+
+# ─── Gemini (Google OpenAI-compatible endpoint) ───────────────────────────────
+
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type((
+        openai.APIConnectionError,
+        openai.RateLimitError,
+        openai.InternalServerError,
+        openai.APITimeoutError,
+    )),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _gemini_chat(messages: list, model: str, tools: list = None, max_tokens: int = 8192):
+    """Single call to Google's OpenAI-compatible Gemini endpoint. Retries on transient errors."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not set in environment")
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
+    kwargs: dict = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    if tools:
+        kwargs["tools"]       = tools
+        kwargs["tool_choice"] = "auto"
+
+    return client.chat.completions.create(**kwargs)
+
+
+def run_agent_gemini(
+    system: str,
+    user_prompt: str,
+    tools_schema: list = None,
+    execute_fn=None,
+    max_tool_calls: int = 8,
+    model: str = "gemini-2.5-flash",
+    tool_call_limits: dict = None,
+    max_tokens: int = 8192,
+    cap_message: str = None,
+) -> str:
+    """
+    Agentic loop using Google's Gemini via their OpenAI-compatible endpoint.
+    Same tool-call pattern as run_agent_local — drop-in replacement.
+    Requires GEMINI_API_KEY in environment.
+
+    tool_call_limits: optional per-tool cap, e.g. {"get_injury_report": 4}.
+    When a tool hits its limit, a budget-exceeded error is returned instead of
+    calling the function, so remaining calls are preserved for other tools.
+
+    cap_message: custom message injected when max_tool_calls is reached.
+    Should include the expected output schema so the model knows the exact format.
+    Defaults to a generic "output your JSON now" prompt if not provided.
+    """
+    openai_tools    = [_to_openai_tool(t) for t in (tools_schema or [])]
+    messages        = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user_prompt},
+    ]
+    tool_calls_used  = 0
+    per_tool_counts  = {}   # tracks calls per tool name this run
+    last_content     = ""
+
+    while True:
+        use_tools    = openai_tools if (tool_calls_used < max_tool_calls and openai_tools) else None
+        response     = _gemini_chat(messages, model, tools=use_tools, max_tokens=max_tokens)
+        msg          = response.choices[0].message
+        tool_calls   = msg.tool_calls or []
+        last_content = msg.content or ""
+
+        if not tool_calls or not use_tools:
+            break
+
+        tool_calls_used += len(tool_calls)
+
+        # Add assistant turn (SDK message object preserves tool_calls for Gemini context)
+        messages.append(msg)
+
+        for tc in tool_calls:
+            fn_name = tc.function.name
+            per_tool_counts[fn_name] = per_tool_counts.get(fn_name, 0) + 1
+
+            # Per-tool budget check
+            limit = (tool_call_limits or {}).get(fn_name)
+            if limit is not None and per_tool_counts[fn_name] > limit:
+                logger.warning(
+                    f"[GEMINI] Per-tool cap for '{fn_name}' ({limit}) reached — "
+                    "returning budget error to agent"
+                )
+                result = {
+                    "error": "tool_budget_exceeded",
+                    "message": (
+                        f"'{fn_name}' call limit ({limit}) reached for this batch. "
+                        "Use web_search as a fallback for any remaining research."
+                    ),
+                }
+            else:
+                try:
+                    args   = json.loads(tc.function.arguments)
+                    fn     = execute_fn or dispatch
+                    result = fn(fn_name, args)
+                except Exception as e:
+                    result = {"error": str(e)}
+
+            messages.append({
+                "role":         "tool",
+                "tool_call_id": tc.id,
+                "content":      json.dumps(result, default=str),
+            })
+
+        if tool_calls_used >= max_tool_calls:
+            logger.warning(f"[GEMINI] Tool cap ({max_tool_calls}) reached — forcing final response")
+            messages.append({
+                "role":    "user",
+                "content": cap_message or (
+                    "IMPORTANT: You have used the maximum number of tool calls. "
+                    "Output your final JSON analysis now based on what you have gathered."
+                ),
+            })
+
+    return last_content
+
+
+# ─── Grok (xAI OpenAI-compatible endpoint) ───────────────────────────────────
+
+GROK_MODEL = "grok-3-mini"
+
+
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type((
+        openai.APIConnectionError,
+        openai.RateLimitError,
+        openai.InternalServerError,
+        openai.APITimeoutError,
+    )),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _grok_chat(messages: list, model: str, tools: list = None):
+    """Single call to xAI's Grok endpoint. Retries on transient errors."""
+    api_key = os.getenv("GROK_API_KEY")
+    if not api_key:
+        raise ValueError("GROK_API_KEY not set")
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.x.ai/v1",
+    )
+    kwargs: dict = {"model": model, "messages": messages}
+    if tools:
+        kwargs["tools"]       = tools
+        kwargs["tool_choice"] = "auto"
+
+    return client.chat.completions.create(**kwargs)
+
+
+def run_agent_grok(
+    system: str,
+    user_prompt: str,
+    tools_schema: list = None,
+    execute_fn=None,
+    max_tool_calls: int = 4,
+    model: str = GROK_MODEL,
+) -> str:
+    """
+    Agentic loop using xAI's Grok via their OpenAI-compatible endpoint.
+    Requires GROK_API_KEY in environment.
+
+    Used by Max as a breaking-news pre-pass (X/Twitter real-time data).
+    Same tool-call pattern as run_agent_gemini.
+    """
+    openai_tools    = [_to_openai_tool(t) for t in (tools_schema or [])]
+    messages        = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user_prompt},
+    ]
+    tool_calls_used = 0
+    last_content    = ""
+
+    while True:
+        use_tools    = openai_tools if (tool_calls_used < max_tool_calls and openai_tools) else None
+        response     = _grok_chat(messages, model, tools=use_tools)
+        msg          = response.choices[0].message
+        tool_calls   = msg.tool_calls or []
+        last_content = msg.content or ""
+
+        if not tool_calls or not use_tools:
+            break
+
+        tool_calls_used += len(tool_calls)
+        messages.append(msg)
+
+        for tc in tool_calls:
+            fn_name = tc.function.name
+            try:
+                args   = json.loads(tc.function.arguments)
+                fn     = execute_fn or dispatch
+                result = fn(fn_name, args)
+            except Exception as e:
+                result = {"error": str(e)}
+
+            messages.append({
+                "role":         "tool",
+                "tool_call_id": tc.id,
+                "content":      json.dumps(result, default=str),
+            })
+
+        if tool_calls_used >= max_tool_calls:
+            logger.warning(f"[GROK] Tool cap ({max_tool_calls}) reached — summarising")
+            messages.append({
+                "role":    "user",
+                "content": "Summarise the key findings from your research so far.",
+            })
+
+    return last_content
+
+
+# ─── JSON extractor ───────────────────────────────────────────────────────────
+
+def extract_json(text: str):
+    """
+    Robustly extract a JSON object or array from LLM response text.
+    Handles markdown code blocks and surrounding prose.
+    Returns parsed dict/list or {} on failure.
+    """
+    if not text:
+        return {}
+    text = text.strip()
+
+    # Direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Extract from ```json ... ``` or ``` ... ```
+    match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Find the largest {...} block
+    match = re.search(r"(\{[\s\S]+\})", text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Find the largest [...] block
+    match = re.search(r"(\[[\s\S]+\])", text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    return {}

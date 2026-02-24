@@ -1,0 +1,37 @@
+# ─── Secrets & credentials ───────────────────────────────────────────────────
+.env
+
+# ─── Databases ───────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ─── Logs & runtime state ────────────────────────────────────────────────────
+*.log
+bot_status.json
+
+# ─── Generated agent outputs (batch reports & picks) ─────────────────────────
+agents/reports/
+scraper_data/agents_*.json
+agents/agent_pipeline.log
+
+# ─── Runtime agent memory (auto-generated, not part of source) ───────────────
+agents/memory.md
+agents/self-review.md
+agents/BRAIN.md
+
+# ─── Personal dev notes ──────────────────────────────────────────────────────
+tasks/
+
+# ─── Python cache ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ─── Claude internal ─────────────────────────────────────────────────────────
+.claude/
+
+# ─── Stray files ─────────────────────────────────────────────────────────────
+nul
