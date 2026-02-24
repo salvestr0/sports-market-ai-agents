@@ -257,6 +257,21 @@ def _handle_run_command():
         batch_lock.release()
 
 
+_COMPLEX_KEYWORDS = {
+    "why", "should", "strategy", "recommend", "analyse", "analyze",
+    "compare", "think", "opinion", "improve", "change", "explain",
+    "decide", "reason", "consider", "evaluate", "assess", "suggest",
+    "advice", "better", "worse", "best", "optimal", "review",
+}
+
+def _pick_model(text: str) -> str:
+    """Haiku for simple lookups, Sonnet for reasoning/analysis."""
+    words = set(text.lower().split())
+    if len(text) > 120 or words & _COMPLEX_KEYWORDS:
+        return "claude-sonnet-4-6"
+    return "claude-haiku-4-5-20251001"
+
+
 def _handle_question(text: str):
     """Answer a free-text question using Claude with full pipeline context."""
     try:
@@ -290,7 +305,7 @@ Owner's question: {text}"""
     try:
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=_pick_model(text),
             max_tokens=500,
             system=system,
             messages=[{"role": "user", "content": user_prompt}],
