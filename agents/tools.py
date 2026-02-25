@@ -7,6 +7,9 @@ Tools available:
   get_polymarket_market(home, away)    — Polymarket Gamma API market lookup
   get_nba_game_log(team_name)          — NBA Stats API last-N-games form (no key needed)
   get_recent_results(sport, team_name) — Odds API scores: last 3 days, all sports (cached per sport)
+  get_live_scores(sport)               — Odds API in-progress scores, 2-min cache
+  write_lesson(agent, what, fix, rule) — Append a row to agents/LEARNINGS.md
+  update_brain(section, content)       — Replace a section in agents/BRAIN.md
 
 Utilities:
   dispatch(name, input_data)      — Routes tool calls to Python functions
@@ -280,6 +283,85 @@ TOOL_GET_RECENT_RESULTS = {
             },
         },
         "required": ["sport", "team_name"],
+    },
+}
+
+TOOL_GET_LIVE_SCORES = {
+    "name": "get_live_scores",
+    "description": (
+        "Fetch in-progress game scores from The Odds API. Returns games from the last 24h "
+        "that are still live (not yet completed but scores are populated). "
+        "Use when the user asks 'what's the score?' or 'how's my open bet doing?'. "
+        "If sport is omitted, queries all tracked sports."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sport": {
+                "type": "string",
+                "description": (
+                    "Odds API sport key, e.g. basketball_nba, soccer_epl. "
+                    "Leave empty to query all tracked sports."
+                ),
+                "default": "",
+            },
+        },
+        "required": [],
+    },
+}
+
+TOOL_WRITE_LESSON = {
+    "name": "write_lesson",
+    "description": (
+        "Append a new row to the LEARNINGS.md mistake log. "
+        "Call this when you notice a clear pattern across this batch "
+        "(e.g. all 5 skips were lumi_abort, edge was consistently 2-3%). "
+        "Do NOT call for a single observation — minimum 3 events needed for a pattern."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "agent_name": {
+                "type": "string",
+                "description": "Which agent or pipeline stage: Max, Nova, Lumi, Sage, or Pipeline",
+            },
+            "what_went_wrong": {
+                "type": "string",
+                "description": "1-2 sentences describing the pattern observed",
+            },
+            "correction": {
+                "type": "string",
+                "description": "What should be done differently",
+            },
+            "rule_generated": {
+                "type": "string",
+                "description": "Actionable rule in imperative form, e.g. 'Always X when Y'",
+            },
+        },
+        "required": ["agent_name", "what_went_wrong", "correction", "rule_generated"],
+    },
+}
+
+TOOL_UPDATE_BRAIN = {
+    "name": "update_brain",
+    "description": (
+        "Update a named section in agents/BRAIN.md. "
+        "Use this to revise 'Current Focus' or 'Active Hypotheses' when this batch "
+        "changes your view on what the team should be tracking."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "section": {
+                "type": "string",
+                "description": "Exact section header name, e.g. 'Current Focus', 'Active Hypotheses'",
+            },
+            "content": {
+                "type": "string",
+                "description": "New markdown content to replace the section (bullet list format)",
+            },
+        },
+        "required": ["section", "content"],
     },
 }
 
@@ -620,6 +702,121 @@ def get_recent_results(sport: str, team_name: str, num_games: int = 3) -> dict:
         "record_last_n": record,
         "results":       matches,
         "note":          "3-day window only — use web_search for full 5-game form history",
+    }
+
+
+# ─── get_live_scores ─────────────────────────────────────────────────────────
+
+# Sports queried when no specific sport is requested
+_LIVE_SCORE_SPORTS = [
+    "basketball_nba",
+    "americanfootball_nfl",
+    "soccer_epl",
+    "soccer_uefa_champs_league",
+    "mma_mixed_martial_arts",
+]
+
+
+def get_live_scores(sport: str = "") -> dict:
+    """
+    Fetch in-progress game scores from The Odds API scores endpoint.
+    Filters to games where completed is False but scores are non-null (game is live).
+    Results cached with 2-minute TTL — live data changes.
+
+    Args:
+        sport: Odds API sport key. If empty, queries all _LIVE_SCORE_SPORTS.
+
+    Returns:
+        {
+          "found": True/False,
+          "live_games": [
+            {
+              "sport": "basketball_nba",
+              "home_team": "...", "away_team": "...",
+              "home_score": "...", "away_score": "...",
+              "commence_time": "YYYY-MM-DD HH:MM",
+              "status": "in_progress"
+            }
+          ],
+          "count": N
+        }
+    """
+    api_key = os.getenv("ODDS_API_KEY", "")
+    if not api_key:
+        return {"found": False, "error": "ODDS_API_KEY not configured", "live_games": [], "count": 0}
+
+    sports_to_query = [sport] if sport else _LIVE_SCORE_SPORTS
+    live_games = []
+
+    for s in sports_to_query:
+        with _live_scores_cache_lock:
+            all_events = _live_scores_cache.get(s)
+
+        if all_events is None:
+            try:
+                r = requests.get(
+                    f"https://api.the-odds-api.com/v4/sports/{s}/scores/",
+                    params={"apiKey": api_key, "daysFrom": 1, "dateFormat": "iso"},
+                    timeout=15,
+                )
+                r.raise_for_status()
+                all_events = r.json()
+                with _live_scores_cache_lock:
+                    _live_scores_cache[s] = all_events
+                logger.debug(f"[TOOLS] Live scores fetched for {s}: {len(all_events)} events")
+            except requests.exceptions.HTTPError as e:
+                code = e.response.status_code if e.response else 0
+                if code == 422:
+                    logger.debug(f"[TOOLS] Sport '{s}' not available on scores endpoint")
+                    continue
+                logger.debug(f"[TOOLS] Live scores HTTP error for {s}: {e}")
+                continue
+            except Exception as e:
+                logger.debug(f"[TOOLS] Live scores error for {s}: {e}")
+                continue
+        else:
+            logger.debug(f"[TOOLS] Live scores cache hit for {s}")
+
+        # In-progress = not completed AND scores are populated
+        for event in all_events:
+            if event.get("completed"):
+                continue
+            scores = event.get("scores") or []
+            if not scores:
+                continue  # Not started yet
+
+            home = event.get("home_team", "")
+            away = event.get("away_team", "")
+            score_map = {
+                sc["name"]: sc["score"]
+                for sc in scores
+                if sc.get("name") and sc.get("score") is not None
+            }
+            home_score = score_map.get(home, "?")
+            away_score = score_map.get(away, "?")
+
+            live_games.append({
+                "sport":          s,
+                "home_team":      home,
+                "away_team":      away,
+                "home_score":     home_score,
+                "away_score":     away_score,
+                "commence_time":  event.get("commence_time", "")[:16].replace("T", " "),
+                "status":         "in_progress",
+            })
+
+    if not live_games:
+        return {
+            "found":      False,
+            "message":    "No in-progress games found right now.",
+            "live_games": [],
+            "count":      0,
+        }
+
+    return {
+        "found":      True,
+        "live_games": live_games,
+        "count":      len(live_games),
     }
 
 
@@ -992,6 +1189,10 @@ _injury_session: dict = {}
 _scores_cache: TTLCache = TTLCache(maxsize=32, ttl=1800)
 _scores_cache_lock = threading.RLock()
 
+# Live scores: 2-minute TTL — data changes during games.
+_live_scores_cache: TTLCache = TTLCache(maxsize=16, ttl=120)
+_live_scores_cache_lock = threading.RLock()
+
 
 def reset_injury_session() -> None:
     """Call at the start of each batch to clear the cross-call corruption tracker."""
@@ -1112,6 +1313,101 @@ def get_injury_report(team_name: str, sport: str = "basketball_nba") -> dict:
     }
 
 
+# ─── write_lesson ─────────────────────────────────────────────────────────────
+
+def write_lesson(
+    agent_name: str,
+    what_went_wrong: str,
+    correction: str,
+    rule_generated: str,
+) -> dict:
+    """
+    Append a new row to agents/LEARNINGS.md mistake log table.
+    Called by Sage (via tool) or by sports_bot._reflect_on_outcome (direct Python call).
+
+    Returns:
+        {"written": True, "row": "<markdown row>"} or {"written": False, "error": "..."}
+    """
+    learnings_path = _AGENTS_DIR / "LEARNINGS.md"
+    if not learnings_path.exists():
+        return {"written": False, "error": "LEARNINGS.md not found"}
+
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _esc(s: str) -> str:
+        return str(s).replace("|", "\\|")
+
+    row = (
+        f"| {date_str} | {_esc(agent_name)} | {_esc(what_went_wrong)} "
+        f"| {_esc(correction)} | {_esc(rule_generated)} |"
+    )
+
+    text = learnings_path.read_text(encoding="utf-8")
+
+    # Replace the placeholder row if it's still there
+    placeholder = "| — | — | *(no mistakes logged yet — log starts after first real batch)* | — | — |"
+    if placeholder in text:
+        text = text.replace(placeholder, row)
+    else:
+        # Append after the last table row
+        lines = text.splitlines()
+        last_table_idx = -1
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 4:
+                last_table_idx = i
+        if last_table_idx >= 0:
+            lines.insert(last_table_idx + 1, row)
+            text = "\n".join(lines) + "\n"
+        else:
+            text = text.rstrip() + "\n" + row + "\n"
+
+    learnings_path.write_text(text, encoding="utf-8")
+    logger.info(f"[TOOLS] write_lesson: appended row for {agent_name}")
+    return {"written": True, "row": row}
+
+
+# ─── update_brain ─────────────────────────────────────────────────────────────
+
+def update_brain(section: str, content: str) -> dict:
+    """
+    Replace a named section's content in agents/BRAIN.md.
+    Finds the ## {section} header, replaces everything between it and the next ## header.
+
+    Returns:
+        {"updated": True, "section": section} or {"updated": False, "error": "..."}
+    """
+    brain_path = _AGENTS_DIR / "BRAIN.md"
+    if not brain_path.exists():
+        return {"updated": False, "error": "BRAIN.md not found"}
+
+    text = brain_path.read_text(encoding="utf-8")
+
+    # Find the section header (case-sensitive first, then insensitive)
+    marker = f"## {section}\n"
+    start_idx = text.find(marker)
+    if start_idx < 0:
+        lower_idx = text.lower().find(f"## {section.lower()}\n")
+        if lower_idx < 0:
+            return {"updated": False, "error": f"Section '## {section}' not found in BRAIN.md"}
+        start_idx = lower_idx
+
+    content_start = start_idx + len(marker)
+    end_idx = text.find("\n## ", content_start)
+    if end_idx < 0:
+        end_idx = len(text)
+
+    # Preserve the --- separator between sections if present
+    segment = text[content_start:end_idx]
+    has_separator = segment.rstrip().endswith("---")
+    new_segment = f"\n{content.strip()}\n\n---\n\n" if has_separator else f"\n{content.strip()}\n\n"
+
+    text = text[:content_start] + new_segment + text[end_idx:]
+    brain_path.write_text(text, encoding="utf-8")
+    logger.info(f"[TOOLS] update_brain: updated section '{section}'")
+    return {"updated": True, "section": section}
+
+
 # ─── Tool dispatcher ──────────────────────────────────────────────────────────
 
 def dispatch(name: str, input_data: dict) -> dict:
@@ -1149,6 +1445,22 @@ def dispatch(name: str, input_data: dict) -> dict:
             sport=input_data.get("sport", ""),
             team_name=input_data.get("team_name", ""),
             num_games=input_data.get("num_games", 3),
+        )
+    elif name == "get_live_scores":
+        return get_live_scores(
+            sport=input_data.get("sport", ""),
+        )
+    elif name == "write_lesson":
+        return write_lesson(
+            agent_name=input_data.get("agent_name", "Unknown"),
+            what_went_wrong=input_data.get("what_went_wrong", ""),
+            correction=input_data.get("correction", ""),
+            rule_generated=input_data.get("rule_generated", ""),
+        )
+    elif name == "update_brain":
+        return update_brain(
+            section=input_data.get("section", ""),
+            content=input_data.get("content", ""),
         )
     else:
         return {"error": f"Unknown tool: {name}"}

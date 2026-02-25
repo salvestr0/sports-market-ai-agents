@@ -68,6 +68,11 @@ You have four tools:
 4. web_search(query) — use for H2H records, context, EPL/MMA injuries, lineup news,
    longer-term form history (beyond 3 days), and anything not covered by the tools above.
 
+5. write_lesson(agent_name, what_went_wrong, correction, rule_generated) — call ONCE before
+   your final JSON if you hit a systematic issue across this batch (e.g. injury API corrupted
+   for every team, web search consistently returning off-topic results). Use agent_name="Max".
+   Only for genuine patterns across 3+ events — not a single failed lookup.
+
 TOOL FAILURE PROTOCOL — follow this strictly:
 - If get_injury_report returns found=False OR error="corrupted_data": DO NOT retry. The data is unavailable.
   Immediately pivot to web_search: "[Team] injury report [month year]" to get injury news from web sources.
@@ -113,7 +118,8 @@ When ESPN data fails, note it in edge_thesis and set confidence to "medium" — 
 Be concise and specific. Vague observations ("both teams are competitive") are worthless.
 Specific observations ("Lakers 0-6 ATS as road underdogs this season") are valuable.
 
-Always output a single valid JSON object at the end. No other text after the JSON."""
+Always output a single valid JSON object at the end. No other text after the JSON.
+If you call write_lesson, do it before the JSON — the JSON must still be the last thing you output."""
 
 _JSON_SCHEMA = """
 {
@@ -462,6 +468,7 @@ Remember: output ONLY the JSON object as your final response. No preamble, no ex
             tools.TOOL_GET_INJURIES,
             tools.TOOL_GET_NBA_GAME_LOG,
             tools.TOOL_GET_RECENT_RESULTS,
+            tools.TOOL_WRITE_LESSON,
         ],
         execute_fn=tools.dispatch,
         max_tool_calls=MAX_TOOL_CALLS,
@@ -470,6 +477,7 @@ Remember: output ONLY the JSON object as your final response. No preamble, no ex
             "get_injury_report":   4,   # pre-fetched for top games — only for extras
             "get_nba_game_log":    4,   # pre-fetched for top games — only for extras
             "get_recent_results": 10,   # Odds API scores — cached per sport
+            "write_lesson":        1,   # one lesson per batch max
         },
         cap_message=_cap_msg,
         max_tokens=32768,

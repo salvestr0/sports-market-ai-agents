@@ -58,7 +58,13 @@ For BET decisions, populate the pick with:
   - notes: synthesize Max's edge_thesis + Nova's edge_pct + Lumi's key risk (if any)
   - polymarket_slug: from Nova's polymarket.slug
 
-Output ONLY valid JSON. No prose."""
+Self-learning: After making decisions, check for patterns worth recording:
+  - If you see a recurring skip reason across 3+ events (e.g. all lumi_abort, or all edge_low <3%),
+    call write_lesson before returning your JSON output.
+  - If this batch changes what the team should focus on, call update_brain.
+  - Only call these tools for genuine patterns — not for single-event observations.
+
+Output the picks JSON after any tool calls. No prose outside the JSON."""
 
 _PICK_SCHEMA = """
 {
@@ -270,8 +276,8 @@ Output ONLY the JSON. No other text."""
         model=MODEL,
         system=SYSTEM_PROMPT,
         user_prompt=user_prompt,
-        tools_schema=[],
-        execute_fn=None,
+        tools_schema=[tools.TOOL_WRITE_LESSON, tools.TOOL_UPDATE_BRAIN],
+        execute_fn=tools.dispatch,
     )
 
     result = tools.extract_json(text)
@@ -288,8 +294,8 @@ Output ONLY the JSON. No other text."""
             model=MODEL,
             system=SYSTEM_PROMPT,
             user_prompt=retry_prompt,
-            tools_schema=[],
-            execute_fn=None,
+            tools_schema=[tools.TOOL_WRITE_LESSON, tools.TOOL_UPDATE_BRAIN],
+            execute_fn=tools.dispatch,
         )
         result = tools.extract_json(text2)
 

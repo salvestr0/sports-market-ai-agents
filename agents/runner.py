@@ -453,6 +453,14 @@ def main():
     parser = argparse.ArgumentParser(description="4-Agent Sports Betting Pipeline")
     parser.add_argument("--once", action="store_true", help="Run a single batch then exit")
     parser.add_argument("--test-tools", action="store_true", help="Test tool connectivity and exit")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=0,
+        metavar="MINUTES",
+        help="Run batches automatically every N minutes (e.g. --interval 240 for every 4 hours). "
+             "If 0 (default), wait for /run via Telegram.",
+    )
     args = parser.parse_args()
 
     # Ensure reports dir exists
@@ -471,6 +479,26 @@ def main():
     if args.once:
         with telegram_listener.batch_lock:
             run_batch()
+        return
+
+    if args.interval > 0:
+        # Scheduled auto-run mode
+        interval_s = args.interval * 60
+        logger.info("=" * 65)
+        logger.info("  4-AGENT SPORTS BETTING PIPELINE (SCHEDULED)")
+        logger.info(f"  Auto-run every {args.interval} minutes | Press Ctrl+C to stop")
+        logger.info("=" * 65)
+        # Run immediately on startup, then on the schedule
+        with telegram_listener.batch_lock:
+            run_batch()
+        while True:
+            try:
+                time.sleep(interval_s)
+            except KeyboardInterrupt:
+                logger.info("\nPipeline stopped.")
+                break
+            with telegram_listener.batch_lock:
+                run_batch()
         return
 
     # Manual-trigger mode — no auto-run on startup, no hourly loop.

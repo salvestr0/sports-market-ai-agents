@@ -1239,6 +1239,12 @@ class SportsResolver:
                 f"PnL: ${pnl:+.2f}"
             )
 
+            # Post-resolution reflection: write a 1-line lesson to LEARNINGS.md
+            try:
+                _reflect_on_outcome(bet, outcome, entry_price)
+            except Exception as _e:
+                logger.debug(f"  [REFLECT] Reflection skipped: {_e}")
+
         if resolved > 0:
             perf = self.db.get_performance()
             logger.info(
@@ -1297,6 +1303,81 @@ class SportsResolver:
         except Exception as e:
             logger.debug(f"  [RESOLVE] Failed for {slug}: {e}")
             return None
+
+
+# ─────────────────────────────────────────────
+# POST-RESOLUTION REFLECTION
+# ─────────────────────────────────────────────
+
+def _reflect_on_outcome(bet: dict, outcome: str, entry_price: float) -> None:
+    """
+    Use Claude Haiku to generate a 1-line lesson from a resolved trade and write
+    it to agents/LEARNINGS.md. Called after every WIN/LOSS in resolve_pending().
+
+    Uses Haiku (cheap) — just a single non-agentic completion call.
+    Silently skips if ANTHROPIC_API_KEY not set or agents/LEARNINGS.md not found.
+    """
+    from pathlib import Path as _Path
+    if not _Path("agents/LEARNINGS.md").exists():
+        return
+
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return
+
+    selection    = bet.get("selection", "?")
+    league       = bet.get("league", "?")
+    confidence   = bet.get("confidence", "?")
+    edge_pct     = bet.get("edge_pct", None)
+    edge_str     = f", edge={edge_pct:.1f}%" if edge_pct is not None else ""
+
+    prompt = (
+        f"A sports value bet just resolved.\n"
+        f"  League: {league}\n"
+        f"  Selection: {selection}\n"
+        f"  Entry price: {entry_price:.3f}{edge_str}\n"
+        f"  Confidence: {confidence}\n"
+        f"  Result: {outcome}\n\n"
+        f"In exactly 1 sentence, what is the single most important thing to remember "
+        f"about a trade like this? Focus on what the entry price or confidence level "
+        f"tells us, not just 'we won' or 'we lost'. Be specific and actionable."
+    )
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=120,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        lesson_text = resp.content[0].text.strip() if resp.content else ""
+    except Exception as e:
+        logger.debug(f"  [REFLECT] Haiku call failed: {e}")
+        return
+
+    if not lesson_text:
+        return
+
+    correction = (
+        "Monitor entries near this price level more carefully"
+        if outcome == "LOSS"
+        else "This entry profile is working — reinforce these conditions"
+    )
+    rule = f"{'Avoid' if outcome == 'LOSS' else 'Favour'} {selection}-style entries at {entry_price:.2f} with {confidence} confidence"
+
+    try:
+        from agents.tools import write_lesson
+        result = write_lesson(
+            agent_name="Pipeline",
+            what_went_wrong=lesson_text if outcome == "LOSS" else f"(WIN) {lesson_text}",
+            correction=correction,
+            rule_generated=rule,
+        )
+        if result.get("written"):
+            logger.debug(f"  [REFLECT] Lesson written for {outcome} on {selection}")
+    except Exception as e:
+        logger.debug(f"  [REFLECT] write_lesson call failed: {e}")
 
 
 # ─────────────────────────────────────────────

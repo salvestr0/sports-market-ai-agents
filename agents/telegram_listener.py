@@ -129,6 +129,81 @@ def _open_trades_summary() -> str:
         return ""
 
 
+def _live_scores_for_open_bets() -> str:
+    """
+    Query sports_trades.db for open bets, fetch live scores for those sports,
+    and return a formatted block showing current scores for any matching games.
+    Returns "" if no open bets, no live games, or scores unavailable.
+    """
+    db_path = "sports_trades.db"
+    if not os.path.exists(db_path):
+        return ""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT home_team, away_team, selection, league "
+            "FROM trades WHERE status='open' AND source='sage_agent' ORDER BY created_at ASC"
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"[TG Listener] Could not read open trades for live scores: {e}")
+        return ""
+
+    if not rows:
+        return ""
+
+    # Determine which sports to query based on open bets
+    _LEAGUE_TO_SPORT = {
+        "NBA":  "basketball_nba",
+        "NFL":  "americanfootball_nfl",
+        "EPL":  "soccer_epl",
+        "UCL":  "soccer_uefa_champs_league",
+        "MMA":  "mma_mixed_martial_arts",
+        "UFC":  "mma_mixed_martial_arts",
+    }
+    sports_needed = set()
+    for _, _, _, league in rows:
+        sport_key = _LEAGUE_TO_SPORT.get((league or "").upper())
+        if sport_key:
+            sports_needed.add(sport_key)
+
+    try:
+        from agents.tools import get_live_scores
+        live_data = get_live_scores("")  # queries all tracked sports at once
+    except Exception as e:
+        logger.warning(f"[TG Listener] Live scores fetch failed: {e}")
+        return ""
+
+    live_games = live_data.get("live_games", [])
+    if not live_games:
+        return ""
+
+    from agents.tools import _names_match
+    matched_lines = []
+    for home_team, away_team, selection, league in rows:
+        for game in live_games:
+            g_home = game.get("home_team", "")
+            g_away = game.get("away_team", "")
+            if (
+                _names_match(home_team or "", g_home)
+                or _names_match(away_team or "", g_away)
+                or _names_match(home_team or "", g_away)
+                or _names_match(away_team or "", g_home)
+            ):
+                matched_lines.append(
+                    f"  🏟 {g_home} {game['home_score']} – {game['away_score']} {g_away}"
+                    f"  (betting: {selection})"
+                )
+                break  # only one game per open bet
+
+    if not matched_lines:
+        return ""
+
+    lines = [f"Live scores for open bet(s):"] + matched_lines
+    return "\n".join(lines) + "\n"
+
+
 def _build_context_summary() -> str:
     """Build a concise text summary of the latest agent reports for Claude."""
     parts = []
@@ -179,12 +254,15 @@ def _build_context_summary() -> str:
             lines = ["Sage approved 0 bets this run."]
         parts.append("\n".join(lines))
     open_trades = _open_trades_summary()
+    live_scores = _live_scores_for_open_bets()
     if not parts and not open_trades:
         return "No reports available yet — the pipeline hasn't run."
     ts = _last_batch_ts or "unknown"
     header = f"[Last batch: {ts}]\n"
     if open_trades:
         header += f"\n{open_trades}"
+    if live_scores:
+        header += f"\n{live_scores}"
     return header + "\n" + "\n\n".join(parts)
 # ─── Command handlers ─────────────────────────────────────────────────────────
 def _handle_help():

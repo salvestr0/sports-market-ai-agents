@@ -70,6 +70,11 @@ PROCEED:
   - Edge clearly present (>= 8%) OR strong Max confidence with solid research
   - Good Polymarket liquidity (> $5,000)
 
+Self-learning: You have access to write_lesson(agent_name, what_went_wrong, correction, rule_generated).
+Call it ONCE before your JSON if you notice a clear pattern across 3+ events this batch
+(e.g. you ABORTed every event for the same reason, or every event had direction_conflict).
+Use agent_name="Lumi". Only for genuine patterns — not single-event observations.
+
 Output only the JSON. No prose after the JSON block."""
 
 _JSON_SCHEMA = """
@@ -198,6 +203,9 @@ Output ONLY the JSON object."""
         system=SYSTEM_PROMPT,
         user_prompt=user_prompt,
         model=MODEL,
+        tools_schema=[tools.TOOL_WRITE_LESSON],
+        execute_fn=tools.dispatch,
+        tool_call_limits={"write_lesson": 1},
     )
 
     result = tools.extract_json(text)

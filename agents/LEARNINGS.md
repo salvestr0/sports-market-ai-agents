@@ -53,4 +53,4 @@
 
 | Date | Agent | What went wrong | Correction | Rule generated |
 |------|-------|-----------------|------------|----------------|
-| â€” | â€” | *(no mistakes logged yet â€” log starts after first real batch)* | â€” | â€” |
+| — | — | *(no mistakes logged yet — log starts after first real batch)* | — | — |
