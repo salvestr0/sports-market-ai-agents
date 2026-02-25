@@ -229,8 +229,7 @@ def get_summary(n_events: int = 60) -> str:
                                      WHEN blockers LIKE '%lumi_abort%'    THEN 'lumi_abort'
                                      WHEN blockers LIKE '%max_uncertain%' THEN 'uncertain'
                                      ELSE 'other' END
-                            ) END,
-                       ', '
+                            ) END
                    ) AS top_blocks
             FROM batch_events
             GROUP BY batch_id

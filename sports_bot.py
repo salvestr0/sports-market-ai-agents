@@ -551,12 +551,12 @@ Drop JSON pick files into this folder. The bot reads them automatically.
 - event_start: ISO8601 UTC datetime
 - polymarket_slug: (optional) if you know the exact Polymarket market slug
 
-## Confidence → bet filter
-  high   → bot bets if edge >= min_edge_pct
-  medium → bot bets if edge >= min_edge_pct + 2%
-  low    → bot skips (never bet low confidence)
-"""
-        with open(spec_path, "w") as f:
+        ## Confidence → bet filter
+        high   → bot bets if edge >= min_edge_pct
+        medium → bot bets if edge >= min_edge_pct + 2%
+        low    → bot skips (never bet low confidence)
+        """
+        with open(spec_path, "w", encoding="utf-8") as f:
             f.write(spec)
         logger.info(f"  [SCRAPER] Wrote pick format spec to {spec_path}")
 
