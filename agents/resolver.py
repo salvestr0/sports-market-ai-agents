@@ -60,32 +60,6 @@ def check_trade_resolution(slug: str, selection: str):
 
         for outcome, price in zip(outcomes, prices):
             if price >= 0.95:
-                # region agent log
-                try:
-                    import json as _json, time as _time
-                    with open("debug-431097.log", "a", encoding="utf-8") as _f:
-                        _f.write(
-                            _json.dumps(
-                                {
-                                    "sessionId": "431097",
-                                    "runId": "initial",
-                                    "hypothesisId": "H3",
-                                    "location": "agents/resolver.py:check_trade_resolution",
-                                    "message": "resolution_outcome",
-                                    "data": {
-                                        "slug": slug,
-                                        "selection": selection,
-                                        "winner_outcome": outcome,
-                                        "winner_price": price,
-                                    },
-                                    "timestamp": int(_time.time() * 1000),
-                                }
-                            )
-                            + "\n"
-                        )
-                except Exception:
-                    pass
-                # endregion
                 return "WIN" if tools._names_match(outcome, selection, 0.5) else "LOSS"
 
         return None  # resolved flag set but no clear winner yet

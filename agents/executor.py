@@ -165,27 +165,6 @@ def _resolve_token(slug: str, selection: str) -> tuple:
 
 def _kelly_size(model_prob: float, price: float, cfg: dict) -> float:
     """25% fractional Kelly, clamped to [min_bet, max_bet]. Returns 0 if no edge."""
-    # region agent log
-    try:
-        import json as _json, time as _time
-        with open("debug-431097.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                _json.dumps(
-                    {
-                        "sessionId": "431097",
-                        "runId": "initial",
-                        "hypothesisId": "H2",
-                        "location": "agents/executor.py:_kelly_size",
-                        "message": "kelly_size inputs",
-                        "data": {"model_prob": model_prob, "price": price},
-                        "timestamp": int(_time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    # endregion
     if price <= 0 or price >= 1:
         return cfg["min_bet"]
     kelly_full = (model_prob - price) / (1 - price)
