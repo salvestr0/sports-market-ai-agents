@@ -1639,10 +1639,11 @@ def _api_call_with_retry(client, **kwargs):
     Retry wrapper for Anthropic API calls.
     Retries on transient server errors (500, 529 overloaded, network failures).
     Fails immediately on client errors (4xx) — those won't fix themselves.
-    Backoff: 5s → 15s → 30s → 60s → 120s (6 attempts total, ~4 min total wait).
+    Backoff: 10s → 30s → 60s → 120s → 240s → 480s (7 attempts total, ~16 min total wait).
+    529 overloads can last many minutes — the longer schedule handles real outages.
     """
-    delays = [5, 15, 30, 60, 120]
-    max_attempts = len(delays) + 1  # 6
+    delays = [10, 30, 60, 120, 240, 480]
+    max_attempts = len(delays) + 1  # 7
     for attempt in range(max_attempts):
         try:
             return client.messages.create(**kwargs)

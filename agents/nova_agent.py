@@ -131,9 +131,10 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
         away_sharp = 0
 
     # ── Step 3: Edge calculation ─────────────────────────────────────────────
-    edge_data   = {}
-    nova_verdict = "UNKNOWN"
-    notes        = ""
+    edge_data     = {}
+    nova_verdict  = "UNKNOWN"
+    unknown_reason = None
+    notes          = ""
 
     if not pm_data["found"]:
         nova_verdict = "NO_MARKET"
@@ -142,8 +143,20 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
     elif not sharp_data["found"]:
         nova_verdict = "UNKNOWN"
         reason = sharp_data.get("message", sharp_data.get("error", "no reason given"))
-        notes = f"No sharp odds: {reason}"
-        logger.warning(f"[Nova] UNKNOWN odds — {event_id}: {reason}")
+        # Classify the reason so Lumi/Sage can act on it without parsing prose
+        reason_lower = reason.lower()
+        if "not available" in reason_lower or "422" in reason:
+            unknown_reason = "sport_not_available"
+        elif "no sharp book odds" in reason_lower or "no sharp" in reason_lower:
+            unknown_reason = "no_books_posted_yet"  # event exists, books haven't priced it yet
+        elif "no event found" in reason_lower:
+            unknown_reason = "event_not_found"
+        elif "not configured" in reason_lower or "api_key" in reason_lower:
+            unknown_reason = "api_key_missing"
+        else:
+            unknown_reason = "api_error"
+        notes = f"No sharp odds ({unknown_reason}): {reason}"
+        logger.warning(f"[Nova] UNKNOWN odds — {event_id}: {unknown_reason} — {reason}")
     else:
         home_edge = home_sharp - pm_data["home_price"]
         away_edge = away_sharp - pm_data["away_price"]
@@ -223,6 +236,7 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
         } if sharp_data["found"] else {},
         "edge":                edge_data,
         "nova_verdict":        nova_verdict,
+        "unknown_reason":      unknown_reason if nova_verdict == "UNKNOWN" else None,
         "notes":               notes,
     }
 

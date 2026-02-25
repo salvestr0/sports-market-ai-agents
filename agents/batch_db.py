@@ -7,6 +7,7 @@ like "how often does NHL convert?" or "is max_confidence_low the main blocker?"
 
 Public API:
   log_batch(batch_id, batch_ts, candidates, nova_analyses, lumi_assessments, picks)
+  update_outcomes(resolved_trades)  — back-propagate WIN/LOSS from sports_bot resolution
   get_summary(n_events=50) -> str   — concise block for injection into Sage's prompt
 """
 
@@ -140,6 +141,51 @@ def log_batch(
         conn.close()
 
 
+def update_outcomes(resolved_trades: list) -> None:
+    """
+    Back-propagate settled trade outcomes to batch_history.db so get_summary()
+    can report win rates, P&L per league, etc.
+
+    resolved_trades: list of dicts with keys:
+      selection  (str)  — team name, matches batch_events.selection
+      outcome    (str)  — 'WIN' or 'LOSS'
+      pnl        (float)
+
+    Matches on selection + outcome='pending' — updates the most recent pending row.
+    Non-fatal: silently logs and returns if DB unavailable.
+    """
+    if not DB_PATH.exists() or not resolved_trades:
+        return
+    try:
+        conn = _open()
+        updated = 0
+        for trade in resolved_trades:
+            selection = trade.get("selection", "")
+            outcome   = trade.get("outcome", "")
+            pnl       = trade.get("pnl", 0.0)
+            if not selection or outcome not in ("WIN", "LOSS"):
+                continue
+            cur = conn.execute(
+                """
+                UPDATE batch_events SET outcome=?, pnl=?
+                WHERE id = (
+                    SELECT id FROM batch_events
+                    WHERE selection=? AND outcome='pending' AND sage_decision='BET'
+                    ORDER BY batch_ts DESC LIMIT 1
+                )
+                """,
+                (outcome, pnl, selection),
+            )
+            if cur.rowcount:
+                updated += 1
+        conn.commit()
+        conn.close()
+        if updated:
+            logger.info(f"[BatchDB] Back-propagated {updated} outcome(s) to batch_history.db")
+    except Exception as e:
+        logger.warning(f"[BatchDB] update_outcomes failed: {e}")
+
+
 def get_summary(n_events: int = 60) -> str:
     """
     Return a concise pipeline performance summary for injection into Sage's prompt.
@@ -243,9 +289,35 @@ def get_summary(n_events: int = 60) -> str:
             for r in cur.fetchall()
         )
 
+        # ── Resolved outcomes (win rate + P&L attribution) ────────────────────
+        cur.execute(
+            """
+            SELECT outcome,
+                   COUNT(*)        AS n,
+                   ROUND(SUM(pnl), 2) AS total_pnl
+            FROM batch_events
+            WHERE sage_decision = 'BET' AND outcome != 'pending'
+            GROUP BY outcome
+            """,
+        )
+        resolved_rows = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+        wins_n,   wins_pnl  = resolved_rows.get("WIN",  (0, 0.0))
+        losses_n, losses_pnl = resolved_rows.get("LOSS", (0, 0.0))
+        resolved_total = wins_n + losses_n
+        if resolved_total > 0:
+            win_rate = f"{wins_n / resolved_total:.0%}"
+            total_pnl = (wins_pnl or 0.0) + (losses_pnl or 0.0)
+            outcomes_line = (
+                f"Resolved: {resolved_total} bets | {wins_n}W / {losses_n}L | "
+                f"WR: {win_rate} | P&L: ${total_pnl:+.2f}"
+            )
+        else:
+            outcomes_line = "Resolved: 0 bets settled yet"
+
         return (
             f"=== BATCH HISTORY (last {total} events, {batches} batches) ===\n"
-            f"Total researched: {total} | Bets placed: {bets} | Bet rate: {bet_rate}\n\n"
+            f"Total researched: {total} | Bets placed: {bets} | Bet rate: {bet_rate}\n"
+            f"{outcomes_line}\n\n"
             f"Top skip blockers:\n{blocker_lines}\n\n"
             f"By league:\n{league_lines}\n\n"
             f"Recent batches:\n{recent_lines}"

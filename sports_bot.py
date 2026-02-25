@@ -1246,6 +1246,17 @@ class SportsResolver:
             except Exception as _e:
                 logger.debug(f"  [REFLECT] Reflection skipped: {_e}")
 
+            # Back-propagate outcome to batch_history.db so get_summary() can report win rates
+            try:
+                from agents import batch_db as _batch_db
+                _batch_db.update_outcomes([{
+                    "selection": bet.get("selection", ""),
+                    "outcome":   outcome,
+                    "pnl":       round(pnl, 4),
+                }])
+            except Exception as _e:
+                logger.debug(f"  [BATCH_DB] Outcome propagation skipped: {_e}")
+
         if resolved > 0:
             perf = self.db.get_performance()
             logger.info(

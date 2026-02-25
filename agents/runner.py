@@ -70,7 +70,7 @@ SPORTS = [
     "mma_mixed_martial_arts",
 ]
 
-HOURS_AHEAD = 96
+HOURS_AHEAD = 24  # Sharp books post lines ~12-24h out — research beyond 24h produces UNKNOWN edges
 REPORTS_DIR = "agents/reports"
 SCRAPER_DIR = "scraper_data"
 

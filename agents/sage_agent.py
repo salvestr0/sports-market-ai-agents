@@ -52,6 +52,14 @@ Your decision rules are strict:
   IMPORTANT: If an event has no Lumi assessment in the report, treat it as Lumi = PROCEED.
   Missing Lumi assessment is NOT a reason to skip — only an explicit ABORT blocks a bet.
 
+  UNVERIFIED INJURY EXCEPTION — override UNCERTAIN block when ALL of:
+    - Max verdict == UNCERTAIN
+    - Max research.verified_injury_status shows "unverified" for home or away
+    - Nova verdict == VALUE (genuine edge exists despite the uncertainty)
+    - Lumi verdict is PROCEED or CAUTION
+  In this case: approve the bet but cap confidence at "medium" regardless of Max's rating,
+  and prepend "⚠️ Unverified injury:" to the pick notes. The edge is real — unverified ≠ no edge.
+
 For BET decisions, populate the pick with:
   - model_probability: use Nova's consensus_sharp_prob for the selected side
   - confidence: use Max's confidence (but cap at "medium" if Lumi said CAUTION)
@@ -123,7 +131,12 @@ def _compute_quality_report(candidates: list, nova_analyses: list, lumi_assessme
             blockers.append(f"lumi_abort: {reason}")
 
         if c.get("max_verdict") == "UNCERTAIN":
-            blockers.append("max_verdict_uncertain")
+            # Check if uncertainty is due to unverified injury (softer blocker) or genuine coin-flip
+            vis = (c.get("research") or {}).get("verified_injury_status", {})
+            if vis.get("home") == "unverified" or vis.get("away") == "unverified":
+                blockers.append("max_uncertain_injury_unverified")
+            else:
+                blockers.append("max_verdict_uncertain")
         if c.get("confidence") == "low":
             blockers.append("max_confidence_low")
 

@@ -110,10 +110,23 @@ CONFIDENCE CALIBRATION — read this carefully:
              This is the DEFAULT when research is incomplete but some data is known.
   "low"    — Reserve ONLY for: form data missing AND H2H missing AND injury data unavailable.
              If you have ANY reliable data (form, H2H, rest days, context), use "medium".
-  "uncertain" — Use for max_verdict only when direction is a genuine coin-flip.
+  "uncertain" — Use for max_verdict only when direction is a genuine coin-flip with no
+               discernible edge on either side. NOT for unverified injuries — see below.
 
 RULE: Corrupted or unavailable injury data alone does NOT justify "low" confidence.
 When ESPN data fails, note it in edge_thesis and set confidence to "medium" — not "low".
+
+RULE: Do NOT use UNCERTAIN merely because an injury could not be verified.
+If form data + an unverified but plausible injury creates a directional edge, still make a
+directional call (HOME_ADVANTAGE or AWAY_EDGE) with confidence="medium" and set
+verified_injury_status.{home|away} = "unverified". This lets downstream agents bet the edge
+at reduced confidence instead of hard-blocking the entire pick.
+Reserve UNCERTAIN for genuine 50-50 coin-flips where you have no directional view at all.
+
+VERIFIED_INJURY_STATUS — set this per team in research:
+  "confirmed"  — All high-impact injured players were verified via web_search/beat reporter.
+  "unverified" — One or more high-impact players listed in ESPN but not checked via web_search.
+  "none"       — No notable injuries to verify (team is healthy or only minor players out).
 
 Be concise and specific. Vague observations ("both teams are competitive") are worthless.
 Specific observations ("Lakers 0-6 ATS as road underdogs this season") are valuable.
@@ -141,6 +154,10 @@ _JSON_SCHEMA = """
           "away": [{"player": "<name>", "status": "<out|questionable|probable>", "impact": "<high|medium|low>", "verified": "<confirmed_out|game_time_decision|expected_to_play|unverified>", "source": "<espn|web_search|beat_reporter>"}]
         },
         "injury_impact_score": 0.0,
+        "verified_injury_status": {
+          "home": "<confirmed|unverified|none>",
+          "away": "<confirmed|unverified|none>"
+        },
         "key_absentees": {
           "home": ["<player name (role)>"],
           "away": []

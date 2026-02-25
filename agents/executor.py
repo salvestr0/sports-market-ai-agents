@@ -163,14 +163,31 @@ def _resolve_token(slug: str, selection: str) -> tuple:
 
 # ─── Kelly sizing ──────────────────────────────────────────────────────────────
 
-def _kelly_size(model_prob: float, price: float, cfg: dict) -> float:
-    """25% fractional Kelly, clamped to [min_bet, max_bet]. Returns 0 if no edge."""
+_CONFIDENCE_KELLY_SCALE = {
+    "high":   1.00,   # full Kelly fraction (25%)
+    "medium": 0.65,   # ~16% effective Kelly — caution for unverified data
+    "low":    0.00,   # safety net — Sage filters these out but don't bet if reached
+}
+
+def _kelly_size(model_prob: float, price: float, cfg: dict, confidence: str = "medium") -> float:
+    """
+    Confidence-scaled fractional Kelly, clamped to [min_bet, max_bet].
+    Returns 0 if no edge or confidence is 'low'.
+
+    Scale:
+      high   → 1.0x Kelly fraction (e.g. 25% fractional → effectively 25%)
+      medium → 0.65x Kelly fraction (e.g. 25% fractional → effectively 16%)
+      low    → 0 (no bet — Sage should already block these)
+    """
     if price <= 0 or price >= 1:
         return cfg["min_bet"]
     kelly_full = (model_prob - price) / (1 - price)
     if kelly_full <= 0:
         return 0.0
-    return max(cfg["min_bet"], min(kelly_full * cfg["kelly"] * cfg["bankroll"], cfg["max_bet"]))
+    scale = _CONFIDENCE_KELLY_SCALE.get(confidence, 0.65)
+    if scale == 0.0:
+        return 0.0
+    return max(cfg["min_bet"], min(kelly_full * cfg["kelly"] * scale * cfg["bankroll"], cfg["max_bet"]))
 
 
 # ─── CLOB client ──────────────────────────────────────────────────────────────
@@ -277,9 +294,10 @@ def execute_picks(picks: list) -> list:
         result["token_id"] = token_id
         result["price"]    = price
 
-        # 4. Kelly size
+        # 4. Kelly size — scaled by confidence tier
         model_prob = float(pick.get("model_probability", 0.5))
-        size_usd   = _kelly_size(model_prob, price, cfg)
+        confidence = pick.get("confidence", "medium")
+        size_usd   = _kelly_size(model_prob, price, cfg, confidence)
         if size_usd <= 0:
             result["reason"] = (
                 f"No edge — model_prob={model_prob:.3f} <= price={price:.3f}"
@@ -298,7 +316,7 @@ def execute_picks(picks: list) -> list:
             db_id = _record_trade(
                 cfg, pick, token_id, price, size_usd, shares,
                 order_id="", status="open",
-                reason=f"PAPER | model_prob={model_prob:.3f} | {len(outcomes or [])} outcomes",
+                reason=f"PAPER | model_prob={model_prob:.3f} | conf={confidence} | {len(outcomes or [])} outcomes",
             )
             result["status"] = "paper"
             result["db_id"]  = db_id
