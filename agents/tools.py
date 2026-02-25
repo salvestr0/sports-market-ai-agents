@@ -66,7 +66,7 @@ def load_agent_context(agent_name: str) -> str:
     # ── SOUL.md — extract shared principles + this agent's section ───────────
     soul_path = _AGENTS_DIR / "SOUL.md"
     if soul_path.exists():
-        soul_text = soul_path.read_text(encoding="utf-8")
+        soul_text = soul_path.read_text(encoding="utf-8", errors="replace")
 
         # Always include the shared foundation
         shared_start = soul_text.find("## Shared Foundation")
@@ -89,28 +89,28 @@ def load_agent_context(agent_name: str) -> str:
     # ── memory.md — settled knowledge ────────────────────────────────────────
     memory_path = _AGENTS_DIR / "memory.md"
     if memory_path.exists():
-        memory_text = memory_path.read_text(encoding="utf-8").strip()
+        memory_text = memory_path.read_text(encoding="utf-8", errors="replace").strip()
         if memory_text:
             sections.append(f"=== TEAM MEMORY ===\n{memory_text}")
 
     # ── BRAIN.md — live working memory ───────────────────────────────────────
     brain_path = _AGENTS_DIR / "BRAIN.md"
     if brain_path.exists():
-        brain_text = brain_path.read_text(encoding="utf-8").strip()
+        brain_text = brain_path.read_text(encoding="utf-8", errors="replace").strip()
         if brain_text:
             sections.append(f"=== LIVE BRAIN (what we are currently tracking) ===\n{brain_text}")
 
     # ── LEARNINGS.md — active rules from past mistakes ────────────────────────
     learnings_path = _AGENTS_DIR / "LEARNINGS.md"
     if learnings_path.exists():
-        learnings_text = learnings_path.read_text(encoding="utf-8").strip()
+        learnings_text = learnings_path.read_text(encoding="utf-8", errors="replace").strip()
         if learnings_text:
             sections.append(f"=== LEARNINGS (rules from mistakes — follow these) ===\n{learnings_text}")
 
     # ── HEARTBEAT.md — extract this agent's standing questions ───────────────
     heartbeat_path = _AGENTS_DIR / "HEARTBEAT.md"
     if heartbeat_path.exists():
-        hb_text = heartbeat_path.read_text(encoding="utf-8")
+        hb_text = heartbeat_path.read_text(encoding="utf-8", errors="replace")
 
         # Extract shared pulse + this agent's section
         shared_start = hb_text.find("## Shared Pulse")
@@ -127,7 +127,7 @@ def load_agent_context(agent_name: str) -> str:
     # ── SKILLS.md — extract this agent's capability section ─────────────────
     skills_path = _AGENTS_DIR / "SKILLS.md"
     if skills_path.exists():
-        sk_text = skills_path.read_text(encoding="utf-8")
+        sk_text = skills_path.read_text(encoding="utf-8", errors="replace")
 
         skill_header = f"## {agent_name} —"
         sk_start     = sk_text.find(skill_header)
@@ -1501,7 +1501,7 @@ def write_lesson(
         f"| {_esc(correction)} | {_esc(rule_generated)} |"
     )
 
-    text = learnings_path.read_text(encoding="utf-8")
+    text = learnings_path.read_text(encoding="utf-8", errors="replace")
 
     # Replace the placeholder row if it's still there
     placeholder = "| — | — | *(no mistakes logged yet — log starts after first real batch)* | — | — |"
