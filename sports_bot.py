@@ -939,11 +939,12 @@ class SportsSignalEngine:
         size_usd = round(size_usd, 2)
 
         book_str = sharp_line.book if sharp_line else "model_only"
+        sharp_str = f"{sharp_prob:.3f}" if sharp_prob is not None else "N/A"
         reasoning = (
             f"{pick.league}: {pick.home_team} vs {pick.away_team} | "
             f"Backing: {pick.selection} | "
             f"Poly={polymarket_price:.3f} | "
-            f"Sharp({book_str})={sharp_prob:.3f if sharp_prob else 'N/A'} | "
+            f"Sharp({book_str})={sharp_str} | "
             f"Model={pick.model_prob:.3f} | "
             f"Edge={edge_pct:.1f}% | "
             f"Confidence={pick.confidence} | "
