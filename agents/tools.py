@@ -286,6 +286,45 @@ TOOL_GET_RECENT_RESULTS = {
     },
 }
 
+TOOL_GET_OPEN_TRADES = {
+    "name": "get_open_trades",
+    "description": (
+        "Read all currently open bets from the database. "
+        "Returns trade IDs, selections, leagues, amounts, entry prices, and timestamps. "
+        "Always call this first when the user asks about open positions or current bets."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+TOOL_SETTLE_TRADE = {
+    "name": "settle_trade",
+    "description": (
+        "Force-settle a specific trade as WIN or LOSS and write the result to the database. "
+        "Use this when the user tells you a game result, or when Polymarket hasn't updated yet "
+        "but the outcome is known. Calculates PnL automatically from the entry price. "
+        "IMPORTANT: Call get_open_trades first to confirm the trade_id before settling."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "trade_id": {
+                "type": "integer",
+                "description": "Numeric ID of the trade to settle (get it from get_open_trades)",
+            },
+            "outcome": {
+                "type": "string",
+                "enum": ["WIN", "LOSS"],
+                "description": "WIN if the bet won, LOSS if it lost",
+            },
+        },
+        "required": ["trade_id", "outcome"],
+    },
+}
+
 TOOL_GET_LIVE_SCORES = {
     "name": "get_live_scores",
     "description": (
@@ -1313,6 +1352,126 @@ def get_injury_report(team_name: str, sport: str = "basketball_nba") -> dict:
     }
 
 
+# ─── get_open_trades ─────────────────────────────────────────────────────────
+
+def get_open_trades() -> dict:
+    """
+    Read all currently open sage_agent bets from sports_trades.db.
+    Returns {"trades": [...], "count": N}
+    """
+    import sqlite3
+    db_path = "sports_trades.db"
+    if not os.path.exists(db_path):
+        return {"trades": [], "count": 0, "message": "No trades database found yet — no bets placed"}
+
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT id, selection, league, home_team, away_team, amount, price, "
+            "polymarket_slug, created_at, notes "
+            "FROM trades WHERE status='open' AND source='sage_agent' ORDER BY created_at ASC"
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        return {"trades": [], "count": 0, "error": str(e)}
+
+    trades = []
+    for row in rows:
+        tid, selection, league, home, away, amount, price, slug, created, notes = row
+        is_paper = (notes or "").startswith("PAPER")
+        trades.append({
+            "id":              tid,
+            "selection":       selection,
+            "league":          league or "?",
+            "home_team":       home or "?",
+            "away_team":       away or "?",
+            "amount_usd":      amount,
+            "entry_price":     price,
+            "polymarket_slug": slug or "",
+            "opened_at":       (created or "")[:16].replace("T", " ") + " UTC",
+            "mode":            "paper" if is_paper else "live",
+        })
+
+    msg = f"{len(trades)} open bet(s)" if trades else "No open bets right now"
+    return {"trades": trades, "count": len(trades), "message": msg}
+
+
+# ─── settle_trade ─────────────────────────────────────────────────────────────
+
+def settle_trade(trade_id: int, outcome: str) -> dict:
+    """
+    Force-settle a specific trade by ID. Calculates PnL and writes to DB.
+    Used when the user confirms a result or Polymarket API hasn't updated yet.
+
+    Returns a dict with settled status, PnL, and trade details.
+    """
+    import sqlite3
+    outcome = outcome.upper().strip()
+    if outcome not in ("WIN", "LOSS"):
+        return {"settled": False, "error": "outcome must be WIN or LOSS"}
+
+    db_path = "sports_trades.db"
+    if not os.path.exists(db_path):
+        return {"settled": False, "error": "sports_trades.db not found"}
+
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT id, selection, league, price, amount, notes, status "
+            "FROM trades WHERE id=? AND source='sage_agent'",
+            (int(trade_id),),
+        ).fetchone()
+        conn.close()
+    except Exception as e:
+        return {"settled": False, "error": str(e)}
+
+    if not row:
+        return {"settled": False, "error": f"Trade #{trade_id} not found"}
+
+    tid, selection, league, entry_price, amount, notes, current_status = row
+
+    if current_status != "open":
+        return {
+            "settled": False,
+            "error":   f"Trade #{trade_id} ({selection}) is already {current_status}",
+        }
+
+    is_paper = (notes or "").startswith("PAPER")
+    fee      = amount * 0.015 if is_paper else 0.0
+    pnl      = round(amount * (1.0 / entry_price - 1.0) - fee, 4) if outcome == "WIN" \
+               else round(-amount - fee, 4)
+
+    new_status = "won" if outcome == "WIN" else "lost"
+    now_ts     = datetime.now(timezone.utc).isoformat()
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE trades SET status=?, pnl=?, resolved_at=? WHERE id=?",
+            (new_status, pnl, now_ts, tid),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return {"settled": False, "error": f"DB write failed: {e}"}
+
+    logger.info(
+        f"[TOOLS] settle_trade: #{tid} {league} {selection} → {outcome} | PnL: ${pnl:+.2f}"
+    )
+    return {
+        "settled":     True,
+        "trade_id":    tid,
+        "selection":   selection,
+        "league":      league or "?",
+        "outcome":     outcome,
+        "entry_price": entry_price,
+        "amount_usd":  amount,
+        "pnl":         pnl,
+        "mode":        "paper" if is_paper else "live",
+        "message":     f"✅ Settled: {selection} → {outcome} | PnL ${pnl:+.2f}",
+    }
+
+
 # ─── write_lesson ─────────────────────────────────────────────────────────────
 
 def write_lesson(
@@ -1445,6 +1604,13 @@ def dispatch(name: str, input_data: dict) -> dict:
             sport=input_data.get("sport", ""),
             team_name=input_data.get("team_name", ""),
             num_games=input_data.get("num_games", 3),
+        )
+    elif name == "get_open_trades":
+        return get_open_trades()
+    elif name == "settle_trade":
+        return settle_trade(
+            trade_id=input_data.get("trade_id"),
+            outcome=input_data.get("outcome", ""),
         )
     elif name == "get_live_scores":
         return get_live_scores(

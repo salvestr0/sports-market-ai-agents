@@ -271,8 +271,11 @@ def _handle_help():
         "/run — Trigger a full pipeline batch now\n"
         "/status — Quick summary of last batch\n"
         "/reports — Detailed latest agent reports\n"
+        "/bets — Show all open positions\n"
+        "/resolve — Check Polymarket and auto-settle any resolved bets\n"
+        "/settle &lt;id&gt; WIN|LOSS — Force-settle a bet (e.g. /settle 2 WIN)\n"
         "/help — This message\n\n"
-        "<i>Or just type any question and the agent team will answer.</i>"
+        "<i>Or just ask anything — the agents can now actually act on your requests.</i>"
     )
 def _handle_status():
     sage_r = _latest_sage()
@@ -299,6 +302,84 @@ def _handle_reports():
     if len(summary) > 3800:
         summary = summary[:3800] + "\n... (truncated)"
     _send(f"<pre>{summary}</pre>")
+
+
+def _handle_bets():
+    """Show all open positions with IDs (so user can /settle them)."""
+    from agents.tools import get_open_trades
+    data = get_open_trades()
+    trades = data.get("trades", [])
+    if not trades:
+        _send("📭 No open bets right now.")
+        return
+    lines = [f"📂 <b>{len(trades)} open bet(s):</b>"]
+    for t in trades:
+        lines.append(
+            f"\n  <b>#{t['id']}</b> {t['league']} — <b>{t['selection']}</b>\n"
+            f"     ${t['amount_usd']:.2f} @ {t['entry_price']:.3f} | "
+            f"{t['mode'].upper()} | opened {t['opened_at']}"
+        )
+    lines.append("\n<i>Use /settle &lt;id&gt; WIN or /settle &lt;id&gt; LOSS to close a bet.</i>")
+    _send("\n".join(lines))
+
+
+def _handle_resolve():
+    """Poll Polymarket and auto-settle any resolved bets."""
+    _send("🔄 <i>Checking Polymarket for resolved bets...</i>")
+    try:
+        from agents import resolver
+        settled = resolver.resolve_open_trades()
+    except Exception as e:
+        _send(f"⚠️ Resolve failed: <code>{str(e)[:150]}</code>")
+        return
+    if not settled:
+        _send("✅ Checked — no bets have resolved on Polymarket yet.")
+        return
+    wins = sum(1 for t in settled if t["outcome"] == "WIN")
+    losses = len(settled) - wins
+    total_pnl = sum(t["pnl"] for t in settled)
+    lines = [f"📊 <b>Resolved {len(settled)} bet(s)</b> — {wins}W / {losses}L | PnL: ${total_pnl:+.2f}"]
+    for t in settled:
+        lines.append(
+            f"  {'✅' if t['outcome'] == 'WIN' else '❌'} "
+            f"{t['league']} {t['selection']} — ${t['pnl']:+.2f}"
+        )
+    _send("\n".join(lines))
+
+
+def _handle_settle(args: str):
+    """
+    Force-settle a trade. Usage: /settle <id> WIN|LOSS
+    e.g.  /settle 2 WIN
+    """
+    parts = args.strip().split()
+    if len(parts) < 2:
+        _send("⚠️ Usage: /settle &lt;id&gt; WIN or /settle &lt;id&gt; LOSS\nExample: <code>/settle 2 WIN</code>")
+        return
+    try:
+        trade_id = int(parts[0])
+    except ValueError:
+        _send(f"⚠️ Invalid trade ID: <code>{parts[0]}</code> — must be a number.")
+        return
+    outcome = parts[1].upper()
+    if outcome not in ("WIN", "LOSS"):
+        _send(f"⚠️ Outcome must be WIN or LOSS, got: <code>{parts[1]}</code>")
+        return
+    try:
+        from agents.tools import settle_trade
+        result = settle_trade(trade_id, outcome)
+    except Exception as e:
+        _send(f"⚠️ Settle failed: <code>{str(e)[:150]}</code>")
+        return
+    if not result.get("settled"):
+        _send(f"❌ Could not settle: {result.get('error', 'unknown error')}")
+        return
+    emoji = "✅" if outcome == "WIN" else "❌"
+    _send(
+        f"{emoji} <b>Settled #{trade_id}</b>\n"
+        f"  {result['league']} — <b>{result['selection']}</b>\n"
+        f"  Result: <b>{outcome}</b> | PnL: <b>${result['pnl']:+.2f}</b> ({result['mode'].upper()})"
+    )
 def _handle_run_command():
     """Run a batch. Called in its own thread to avoid blocking the poll loop."""
     global _last_batch_ts, _last_picks
@@ -338,7 +419,7 @@ def _pick_model(text: str) -> str:
 
 
 def _handle_question(text: str):
-    """Answer a free-text question using Claude with full pipeline context."""
+    """Answer a free-text question using Claude — with real tools to take action."""
     try:
         import anthropic
     except ImportError:
@@ -350,36 +431,47 @@ def _handle_question(text: str):
         return
     _send("🤔 <i>Thinking...</i>")
     context = _build_context_summary()
+
+    from agents.tools import (
+        TOOL_GET_OPEN_TRADES, TOOL_SETTLE_TRADE, TOOL_GET_LIVE_SCORES,
+        dispatch, run_agent,
+    )
+
     system = """You are the collective voice of four AI sports betting agents: Max (researcher), Nova (odds analyst), Lumi (risk assessor), and Sage (portfolio manager). You are speaking directly to your owner via Telegram.
-Answer their questions naturally, drawing on the pipeline context provided. Be concise (2-5 sentences max unless detail is genuinely needed). Be specific — use real numbers from the reports. Don't be generic.
-If they ask about a specific agent, answer from that agent's perspective. If they ask about strategy, decisions, or improvements, give an honest and analytical response.
-Keep responses under 400 words. Format using plain text + HTML bold (<b>word</b>) for key terms. No markdown."""
+
+You have REAL TOOLS that let you take action — not just words:
+- get_open_trades: see all currently open bets with their IDs and details
+- settle_trade: actually mark a bet as WIN or LOSS in the database
+- get_live_scores: fetch current in-progress game scores
+
+IMPORTANT RULES:
+1. If the owner tells you a game result or asks you to settle/resolve/close a bet — call get_open_trades first to find the right trade ID, then call settle_trade immediately. Do NOT say "I'm settling it" without actually calling the tool.
+2. If they say "we won" or "that game was a win" — figure out which open bet it refers to and call settle_trade for each matching bet.
+3. Never pretend to take an action you cannot take. If in doubt, call the tool.
+4. After settling a bet, confirm the result with the actual PnL figure from the tool response.
+
+Answer questions naturally and concisely (2-5 sentences max). Use real numbers from the context. Format using plain text + HTML bold (<b>word</b>) for key terms. No markdown."""
+
     user_prompt = f"""Pipeline context (latest batch results):
 {context}
-Owner's question: {text}"""
+
+Owner's request: {text}"""
+
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
+        answer = run_agent(
+            client=client,
             model=_pick_model(text),
-            max_tokens=500,
             system=system,
-            messages=[{"role": "user", "content": user_prompt}],
+            user_prompt=user_prompt,
+            tools_schema=[TOOL_GET_OPEN_TRADES, TOOL_SETTLE_TRADE, TOOL_GET_LIVE_SCORES],
+            execute_fn=dispatch,
+            max_tool_calls=10,
         )
-        answer = response.content[0].text if response.content else "Sorry, I couldn't generate a response."
-        _send(f"💬 {answer}")
+        _send(f"💬 {answer}" if answer else "💬 Done.")
     except Exception as e:
         logger.warning(f"[TG Listener] Question handler failed: {e}")
         _send(f"⚠️ Couldn't answer: <code>{str(e)[:150]}</code>")
-def _handle_nova_question(question: str):
-    """Route a question directly to Nova's live odds engine."""
-    _send("🔍 <b>Nova:</b> <i>Fetching live market data...</i>")
-    try:
-        from agents import nova_agent
-        reply = nova_agent.chat(question)
-        _send(f"<b>Nova:</b> {reply}")
-    except Exception as e:
-        logger.error(f"[TG Listener] Nova chat failed: {e}", exc_info=True)
-        _send(f"❌ Nova error: <code>{str(e)[:150]}</code>")
 def _handle_nova_question(question: str):
     """Route a direct question to Nova — fetches live odds and computes edges."""
     _send("🔍 <b>Nova:</b> <i>Fetching live market data...</i>")
@@ -412,13 +504,16 @@ def _process_update(update: dict):
         _handle_status()
     elif cmd in ("reports", "report"):
         _handle_reports()
-    elif cmd in ("help", "start"):
+    elif cmd == "help":
         _handle_help()
+    elif cmd == "bets":
+        threading.Thread(target=_handle_bets, daemon=True).start()
+    elif cmd == "resolve":
+        threading.Thread(target=_handle_resolve, daemon=True).start()
+    elif cmd == "settle":
+        args = " ".join(text.split()[1:])
+        threading.Thread(target=_handle_settle, args=(args,), daemon=True).start()
     elif text_lower.startswith(("nova:", "nova,")):
-        # Route directly to Nova's live odds engine
-        question = text[5:].strip()
-        threading.Thread(target=_handle_nova_question, args=(question,), daemon=True).start()
-    elif text.lower().startswith(("nova:", "nova,")):
         question = text.split(":", 1)[-1].split(",", 1)[-1].strip() if (":" in text or "," in text) else text[4:].strip()
         threading.Thread(target=_handle_nova_question, args=(question,), daemon=True).start()
     else:

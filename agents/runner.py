@@ -21,8 +21,6 @@ Usage:
 
 import os
 import sys
-import sqlite3
-import requests
 
 # Force UTF-8 I/O on Windows (avoids CP1252 encoding errors with Unicode chars)
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -47,7 +45,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from agents import max_agent, nova_agent, lumi_agent, sage_agent
-from agents import notifier, telegram_listener, self_review, tools
+from agents import notifier, telegram_listener, self_review, tools, resolver
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -108,157 +106,6 @@ def _attach_slugs(candidates: list, pm_events: list) -> None:
                 break
 
 
-_PAPER_FEE = 0.015   # 1.5% taker fee simulated in paper mode
-
-
-def _check_trade_resolution(slug: str, selection: str):
-    """
-    Query Polymarket Gamma API for a market by slug.
-    Returns 'WIN', 'LOSS', or None if not yet resolved.
-    """
-    try:
-        r = requests.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"slug": slug},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None
-
-        m = data[0]
-        if not m.get("resolved", False):
-            return None
-
-        prices_raw = m.get("outcomePrices", "")
-        if isinstance(prices_raw, str):
-            prices_raw = json.loads(prices_raw)
-        prices = [float(p) for p in prices_raw] if prices_raw else []
-
-        outcomes_raw = m.get("outcomes", "")
-        if isinstance(outcomes_raw, str):
-            try:
-                outcomes = json.loads(outcomes_raw)
-            except Exception:
-                outcomes = ["Yes", "No"]
-        elif isinstance(outcomes_raw, list):
-            outcomes = outcomes_raw
-        else:
-            outcomes = ["Yes", "No"]
-
-        for outcome, price in zip(outcomes, prices):
-            if price >= 0.95:
-                return "WIN" if tools._names_match(outcome, selection, 0.5) else "LOSS"
-
-        return None  # resolved flag set but no clear winner yet
-    except Exception as e:
-        logger.debug(f"[RESOLVER] Check failed for slug={slug!r}: {e}")
-        return None
-
-
-def _resolve_open_trades():
-    """
-    Check all open agent-pipeline trades in sports_trades.db against Polymarket.
-    Settles any whose markets have resolved — marks as 'won'/'lost' with PnL.
-    Called at the start of every run_batch() so agents always see fresh outcomes.
-    """
-    db_path = "sports_trades.db"
-    if not os.path.exists(db_path):
-        return
-
-    try:
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute(
-            "SELECT id, selection, league, polymarket_slug, price, amount, notes "
-            "FROM trades WHERE status='open' AND source='sage_agent'"
-        ).fetchall()
-        conn.close()
-    except Exception as e:
-        logger.warning(f"[RESOLVER] Could not read open trades: {e}")
-        return
-
-    if not rows:
-        return
-
-    logger.info(f"[RESOLVER] Checking {len(rows)} open trade(s) against Polymarket...")
-    settled = []
-
-    for trade_id, selection, league, slug, entry_price, amount, notes in rows:
-        if not slug:
-            continue
-
-        outcome = _check_trade_resolution(slug, selection)
-        if outcome is None:
-            continue
-
-        is_paper = (notes or "").startswith("PAPER")
-        fee = amount * _PAPER_FEE if is_paper else 0.0
-
-        if outcome == "WIN":
-            pnl = round(amount * (1.0 / entry_price - 1.0) - fee, 4)
-        else:
-            pnl = round(-amount - fee, 4)
-
-        new_status = "won" if outcome == "WIN" else "lost"
-        now_ts = datetime.now(timezone.utc).isoformat()
-
-        try:
-            conn = sqlite3.connect(db_path)
-            conn.execute(
-                "UPDATE trades SET status=?, pnl=?, resolved_at=? WHERE id=?",
-                (new_status, pnl, now_ts, trade_id),
-            )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.warning(f"[RESOLVER] DB update failed for trade #{trade_id}: {e}")
-            continue
-
-        emoji = "+++" if outcome == "WIN" else "---"
-        logger.info(
-            f"  [{emoji}] {outcome} | {league} {selection} @ {entry_price:.3f} | "
-            f"PnL: ${pnl:+.2f}{' (paper)' if is_paper else ''}"
-        )
-        settled.append({
-            "id":           trade_id,
-            "selection":    selection,
-            "league":       league or "?",
-            "outcome":      outcome,
-            "entry_price":  entry_price,
-            "amount":       amount,
-            "pnl":          pnl,
-            "is_paper":     is_paper,
-        })
-
-    if not settled:
-        return
-
-    wins      = sum(1 for t in settled if t["outcome"] == "WIN")
-    losses    = len(settled) - wins
-    total_pnl = sum(t["pnl"] for t in settled)
-
-    logger.info(
-        f"[RESOLVER] Settled {len(settled)} trade(s) — "
-        f"W:{wins} L:{losses} | batch PnL: ${total_pnl:+.2f}"
-    )
-
-    notifier.send(
-        f"📊 <b>Bets resolved</b> — {wins}W / {losses}L | PnL: ${total_pnl:+.2f}\n"
-        + "\n".join(
-            f"  {'✅' if t['outcome'] == 'WIN' else '❌'} "
-            f"{t['league']} {t['selection']} — ${t['pnl']:+.2f}"
-            for t in settled
-        )
-    )
-
-    # Post-resolution reflection — write a Haiku-generated lesson per trade
-    for t in settled:
-        try:
-            from sports_bot import _reflect_on_outcome
-            _reflect_on_outcome(t, t["outcome"], t["entry_price"])
-        except Exception as e:
-            logger.debug(f"[RESOLVER] Reflection skipped for {t['selection']}: {e}")
 
 
 def _get_bankroll_context() -> dict:
@@ -388,7 +235,7 @@ def run_batch() -> dict:
     batch_start = _time.time()
 
     _maybe_run_self_review()
-    _resolve_open_trades()        # settle any bets that resolved since last batch
+    resolver.resolve_open_trades()   # settle any bets that resolved since last batch
     tools.reset_injury_session()  # clear cross-call corruption tracker for this batch
 
     logger.info("=" * 65)
