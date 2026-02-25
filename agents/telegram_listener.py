@@ -100,6 +100,35 @@ def _latest_sage():
         return json.loads(latest.read_text(encoding="utf-8"))
     except Exception:
         return None
+def _open_trades_summary() -> str:
+    """Query sports_trades.db for currently open bets. Returns a formatted block."""
+    db_path = "sports_trades.db"
+    if not os.path.exists(db_path):
+        return ""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT id, selection, league, home_team, away_team, amount, price, created_at "
+            "FROM trades WHERE status='open' AND source='sage_agent' ORDER BY created_at ASC"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return "Open positions (sports_trades.db): 0 bets currently open.\n"
+        lines = [f"Open positions (sports_trades.db): {len(rows)} bet(s) currently open:"]
+        for r in rows:
+            tid, selection, league, home, away, amount, price, created = r
+            created_short = (created or "")[:16].replace("T", " ")
+            lines.append(
+                f"  #{tid} | {league}: {selection} (in {home} vs {away})"
+                f" | ${amount:.2f} @ {price:.3f} | opened {created_short} UTC"
+            )
+        return "\n".join(lines) + "\n"
+    except Exception as e:
+        logger.warning(f"[TG Listener] Could not read open trades: {e}")
+        return ""
+
+
 def _build_context_summary() -> str:
     """Build a concise text summary of the latest agent reports for Claude."""
     parts = []
@@ -149,10 +178,14 @@ def _build_context_summary() -> str:
         else:
             lines = ["Sage approved 0 bets this run."]
         parts.append("\n".join(lines))
-    if not parts:
+    open_trades = _open_trades_summary()
+    if not parts and not open_trades:
         return "No reports available yet — the pipeline hasn't run."
     ts = _last_batch_ts or "unknown"
-    return f"[Last batch: {ts}]\n\n" + "\n\n".join(parts)
+    header = f"[Last batch: {ts}]\n"
+    if open_trades:
+        header += f"\n{open_trades}"
+    return header + "\n" + "\n\n".join(parts)
 # ─── Command handlers ─────────────────────────────────────────────────────────
 def _handle_help():
     _send(

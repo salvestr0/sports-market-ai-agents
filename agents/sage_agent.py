@@ -197,12 +197,16 @@ def run(
         win_rate_7d     = bankroll_context.get("win_rate_7d", None)
         pnl_sign        = "+" if total_pnl >= 0 else ""
         wr_str          = f"{win_rate_7d:.0%}" if win_rate_7d is not None else "N/A"
+        open_bets   = bankroll_context.get("open_bets", 0)
+        total_bets  = bankroll_context.get("total_bets", 0)
         bankroll_section = f"""
 === PORTFOLIO HEALTH ===
 Starting bankroll:        ${starting:.2f}
 Total P&L all-time:       {pnl_sign}${total_pnl:.2f}
 Current estimated balance: ${current_balance:.2f}
+Open bets (paper/live):   {open_bets} bet(s) currently open
 Open exposure:            ${open_exposure:.2f}
+Resolved bets (won/lost): {total_bets}
 Recent streak:            {recent_streak}
 7-day win rate:           {wr_str}
 
