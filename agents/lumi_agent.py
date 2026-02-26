@@ -201,7 +201,7 @@ Output the following JSON exactly:
 
 Output ONLY the JSON object."""
 
-    logger.info(f"[Lumi] Assessing risks for {len(candidates)} candidate(s) (Gemini 2.0 Flash)...")
+    logger.info(f"[Lumi] Assessing risks for {len(candidates)} candidate(s) ({MODEL})...")
 
     text = tools.run_agent_gemini(
         system=SYSTEM_PROMPT,
@@ -216,10 +216,14 @@ Output ONLY the JSON object."""
 
     if not result or "assessments" not in result:
         logger.warning("[Lumi] JSON parse failed, retrying...")
+        # Resend the full event data — NOT a truncated slice of the failed response.
+        # Gemini needs all candidates to produce all assessments.
         retry_prompt = (
-            f"Output ONLY valid JSON matching this schema:\n{_JSON_SCHEMA}\n"
-            f"Start with {{ and end with }}\n\n"
-            f"Base your assessment on this prior analysis:\n{text[:2000]}"
+            f"Your previous response could not be parsed as valid JSON.\n"
+            f"Output ONLY valid JSON — start with {{ and end with }}.\n"
+            f"You MUST include exactly {len(candidates)} assessments "
+            f"(one per event_id listed below).\n\n"
+            f"{user_prompt}"
         )
         text2 = tools.run_agent_gemini(
             system=SYSTEM_PROMPT,
