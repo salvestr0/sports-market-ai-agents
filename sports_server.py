@@ -28,6 +28,16 @@ BOT_LOG    = "sports_bot.log"
 _bot_proc = None
 _bot_lock = threading.Lock()
 
+# Agent pipeline subprocess handle
+AGENT_LOG = "agents/runner.log"
+_agent_proc = None
+_agent_lock = threading.Lock()
+
+def agent_running() -> bool:
+    global _agent_proc
+    with _agent_lock:
+        return _agent_proc is not None and _agent_proc.poll() is None
+
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -58,6 +68,14 @@ def tail_log(n: int = 80) -> str:
     except Exception:
         return "No log file yet."
 
+def tail_agent_log(n: int = 100) -> str:
+    try:
+        with open(AGENT_LOG, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return "".join(lines[-n:])
+    except Exception:
+        return "No agent log yet."
+
 def bot_running() -> bool:
     global _bot_proc
     with _bot_lock:
@@ -72,6 +90,7 @@ def bot_running() -> bool:
 def api_status():
     status = read_status()
     status["bot_running"] = bot_running()
+    status["agent_running"] = agent_running()
     return jsonify(status)
 
 @app.route("/api/bets")
@@ -111,6 +130,40 @@ def api_performance():
 @app.route("/api/logs")
 def api_logs():
     return jsonify({"log": tail_log(100)})
+
+@app.route("/api/agent/logs")
+def api_agent_logs():
+    return jsonify({"log": tail_agent_log(100)})
+
+@app.route("/api/agent/start", methods=["POST"])
+def agent_start():
+    global _agent_proc
+    with _agent_lock:
+        if agent_running():
+            return jsonify({"ok": False, "msg": "Agent pipeline already running"})
+        try:
+            os.makedirs("agents", exist_ok=True)
+            _agent_proc = subprocess.Popen(
+                [sys.executable, "-m", "agents.runner"],
+                stdout=open(AGENT_LOG, "a"),
+                stderr=subprocess.STDOUT,
+            )
+            return jsonify({"ok": True, "pid": _agent_proc.pid})
+        except Exception as e:
+            return jsonify({"ok": False, "msg": str(e)})
+
+@app.route("/api/agent/stop", methods=["POST"])
+def agent_stop():
+    global _agent_proc
+    with _agent_lock:
+        if not agent_running():
+            return jsonify({"ok": False, "msg": "Agent pipeline not running"})
+        try:
+            _agent_proc.terminate()
+            _agent_proc.wait(timeout=5)
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"ok": False, "msg": str(e)})
 
 @app.route("/api/scraper-picks")
 def api_scraper_picks():
@@ -361,6 +414,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <button class="btn btn-green" id="btn-start" onclick="startBot()">Start (Paper)</button>
     <button class="btn btn-blue"  id="btn-start-live" onclick="startLive()">Start (Live)</button>
     <button class="btn btn-red"   id="btn-stop" onclick="stopBot()" style="display:none">Stop Bot</button>
+    <div style="border-left:1px solid #333;margin-left:4px;padding-left:12px;display:flex;align-items:center;gap:8px">
+      <div id="agent-status-dot" style="width:10px;height:10px;border-radius:50%;background:#555"></div>
+      <span id="agent-status-text" style="font-size:12px;color:var(--muted)">Agent: Stopped</span>
+      <button class="btn btn-green" id="btn-agent-start" onclick="startAgent()">Start Agents</button>
+      <button class="btn btn-red"   id="btn-agent-stop" onclick="stopAgent()" style="display:none">Stop Agents</button>
+    </div>
   </div>
 </header>
 
@@ -451,6 +510,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   </div>
 
+  <!-- Agent Pipeline Logs -->
+  <div class="panel" style="margin-top:20px">
+    <div class="panel-header">
+      <span><span class="dot dot-blue"></span>Agent Pipeline Log</span>
+      <button class="btn btn-gray" style="font-size:11px;padding:3px 10px" onclick="refreshAgentLog()">Refresh</button>
+    </div>
+    <div id="agent-log-box" style="font-family:'Consolas','Cascadia Code',monospace;font-size:11px;background:#0a0c10;color:#c9d1d9;padding:12px;height:240px;overflow-y:auto;white-space:pre-wrap;word-break:break-all">Loading...</div>
+  </div>
+
 </main>
 
 <script>
@@ -534,6 +602,17 @@ function updateHeader(status) {
     btnStartLive.style.display = '';
     btnStop.style.display = 'none';
   }
+
+  const agentRunning = status.agent_running;
+  const agentDot = document.getElementById('agent-status-dot');
+  const agentTxt = document.getElementById('agent-status-text');
+  const btnAgentStart = document.getElementById('btn-agent-start');
+  const btnAgentStop  = document.getElementById('btn-agent-stop');
+
+  agentDot.style.background = agentRunning ? '#00c853' : '#555';
+  agentTxt.textContent = agentRunning ? 'Agent: Running' : 'Agent: Stopped';
+  btnAgentStart.style.display = agentRunning ? 'none' : '';
+  btnAgentStop.style.display  = agentRunning ? '' : 'none';
 }
 
 function updateStats(perf, open, picks) {
@@ -668,6 +747,26 @@ async function refreshLog() {
   }
 }
 
+async function refreshAgentLog() {
+  const data = await fetchJSON('/api/agent/logs');
+  if (data) {
+    const box = document.getElementById('agent-log-box');
+    box.textContent = data.log;
+    box.scrollTop = box.scrollHeight;
+  }
+}
+
+async function startAgent() {
+  await fetch('/api/agent/start', {method:'POST'});
+  await refresh();
+  await refreshAgentLog();
+}
+
+async function stopAgent() {
+  await fetch('/api/agent/stop', {method:'POST'});
+  await refresh();
+}
+
 async function startBot() {
   await fetch('/api/bot/start', {method:'POST'});
   await refresh();
@@ -689,9 +788,10 @@ async function stopBot() {
 // Initial load
 refresh();
 refreshLog();
+refreshAgentLog();
 
 // Auto-refresh every 30 seconds
-setInterval(() => { refresh(); refreshLog(); }, 30000);
+setInterval(() => { refresh(); refreshLog(); refreshAgentLog(); }, 30000);
 </script>
 </body>
 </html>"""
