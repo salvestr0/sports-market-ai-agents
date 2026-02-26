@@ -105,18 +105,45 @@ def _record_trade(cfg, pick, token_id, price, size_usd, shares, order_id, status
 
 # ─── Duplicate guard ───────────────────────────────────────────────────────────
 
-def _already_bet(cfg, event_id, selection) -> bool:
-    """Return True if we already have an open bet for this event+selection."""
+def _already_bet(cfg, pick: dict) -> bool:
+    """
+    Return True if we already have an open bet for this pick.
+
+    Checks polymarket_slug + selection first (stable API-derived keys that are
+    consistent across pipeline runs), then falls back to event_id + selection
+    (LLM-generated, so less reliable but still useful as a secondary guard).
+    """
+    slug      = pick.get("polymarket_slug", "").strip()
+    selection = pick.get("selection", "").strip()
+    event_id  = pick.get("event_id", "").strip()
     try:
         conn = sqlite3.connect(cfg["db_path"])
         _ensure_trades_table(conn)
-        row = conn.execute(
-            "SELECT id FROM trades WHERE event_id=? AND selection=? "
-            "AND status='open' AND source='sage_agent'",
-            (event_id, selection),
-        ).fetchone()
+
+        # Primary: slug + selection (stable across runs — slug comes from Polymarket API)
+        if slug and selection:
+            row = conn.execute(
+                "SELECT id FROM trades WHERE polymarket_slug=? AND selection=? "
+                "AND status='open' AND source='sage_agent'",
+                (slug, selection),
+            ).fetchone()
+            if row:
+                conn.close()
+                return True
+
+        # Fallback: event_id + selection (LLM-generated, catches same-run dupes)
+        if event_id and selection:
+            row = conn.execute(
+                "SELECT id FROM trades WHERE event_id=? AND selection=? "
+                "AND status='open' AND source='sage_agent'",
+                (event_id, selection),
+            ).fetchone()
+            if row:
+                conn.close()
+                return True
+
         conn.close()
-        return row is not None
+        return False
     except Exception as e:
         logger.warning(f"[Executor] Duplicate check error: {e} — allowing bet")
         return False
@@ -270,7 +297,7 @@ def execute_picks(picks: list) -> list:
             continue
 
         # 2. Duplicate guard
-        if _already_bet(cfg, event_id, selection):
+        if _already_bet(cfg, pick):
             result["reason"] = f"Already have open bet for {selection!r} in {event_id!r}"
             logger.info(f"[Executor] {result['reason']} — skipping")
             result["status"] = "skipped"
