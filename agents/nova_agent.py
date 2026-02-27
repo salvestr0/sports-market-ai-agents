@@ -40,6 +40,25 @@ _LEAGUE_TO_SPORT = {
 # Reverse lookup: Max's sport key → Polymarket league label
 _SPORT_TO_LEAGUE = {v: k for k, v in _LEAGUE_TO_SPORT.items()}
 
+# Partial-game slug patterns — these Polymarket markets can't be compared to full-game sharp lines
+_PARTIAL_SLUG_PATTERNS = (
+    "-1h-", "-2h-",
+    "-1p-", "-2p-", "-3p-",
+    "-1q-", "-2q-", "-q1-", "-q2-",
+)
+
+# Maximum plausible edge per sport — anything above is a contamination signal
+# (e.g. partial-game Polymarket price vs full-game sharp probability)
+_MAX_SANE_EDGE = {
+    "basketball_nba":            15.0,
+    "americanfootball_nfl":      15.0,
+    "soccer_epl":                12.0,
+    "soccer_uefa_champs_league": 12.0,
+    "mma_mixed_martial_arts":    20.0,
+    "icehockey_nhl":             15.0,
+    "baseball_mlb":              15.0,
+}
+
 
 def _find_pm_event(home: str, away: str, pm_events: list, slug: str = "") -> dict | None:
     """
@@ -102,6 +121,30 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
             "found":   False,
             "message": f"No Polymarket market found for {home_team} vs {away_team}",
         }
+
+    # ── Slug audit: reject partial-game markets before fetching sharp odds ───
+    # Partial-game slugs (1H, periods, quarters) produce garbage edges when
+    # compared against full-game sharp probabilities — reject immediately.
+    if pm_data["found"] and pm_event:
+        pm_slug = pm_event.get("slug", "").lower()
+        if any(p in pm_slug for p in _PARTIAL_SLUG_PATTERNS):
+            logger.warning(
+                f"[Nova] PARTIAL_SLUG — {event_id}: slug '{pm_event.get('slug')}' is a "
+                f"partial-game market. Full-game sharp comparison is invalid. Skipping."
+            )
+            return {
+                "event_id":             event_id,
+                "home_team":            home_team,
+                "away_team":            away_team,
+                "league":               league,
+                "polymarket":           pm_data,
+                "sharp_books":          {"found": False},
+                "consensus_sharp_prob": {},
+                "edge":                 {},
+                "nova_verdict":         "UNKNOWN",
+                "unknown_reason":       "partial_game_slug_mismatch",
+                "notes":                f"Partial-game market '{pm_event.get('slug')}' — full-game sharp odds comparison is invalid.",
+            }
 
     # ── Step 2: Sharp book odds ──────────────────────────────────────────────
     odds = tools.get_sharp_odds(sport, home_team, away_team)
@@ -210,7 +253,23 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
             "conflict_note":    conflict_note,
         }
 
-        if best_edge_pct >= 8:
+        # ── Anomalous edge sanity check ──────────────────────────────────────
+        # Real market edges don't exceed ~15% for NBA/NFL. Anything above is a
+        # contamination signal — most likely a partial-game vs full-game mismatch
+        # that slipped through Max's slug filter (e.g. via fuzzy name matching).
+        max_sane = _MAX_SANE_EDGE.get(sport, 15.0)
+        if best_edge_pct > max_sane:
+            logger.warning(
+                f"[Nova] ANOMALOUS_EDGE — {event_id}: {best_edge_pct:.1f}% exceeds "
+                f"{max_sane:.0f}% sanity limit for {league}. Flagging as contamination."
+            )
+            nova_verdict  = "UNKNOWN"
+            unknown_reason = "anomalous_edge_sanity_check"
+            notes = (
+                f"Edge {best_edge_pct:.1f}% exceeds {max_sane:.0f}% sanity limit for {league} — "
+                f"likely market-type mismatch (partial-game vs full-game). Audit slug before betting."
+            )
+        elif best_edge_pct >= 8:
             nova_verdict = "VALUE"
             notes = f"Strong edge: {best_team} at {best_poly_price:.0%} vs sharp {best_sharp_prob:.0%} (+{best_edge_pct:.1f}%)"
         elif best_edge_pct >= 5:

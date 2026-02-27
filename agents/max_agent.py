@@ -37,6 +37,19 @@ _SUPPORTED_INJURY_SPORTS = {
     "MLB": "baseball_mlb",
 }
 
+# Partial-game Polymarket slug patterns — 1H/period/quarter markets that can't be
+# compared against full-game sharp lines. Filter these out before research.
+_PARTIAL_GAME_SLUG_PATTERNS = (
+    "-1h-", "-2h-",           # halves (basketball, soccer, football)
+    "-1p-", "-2p-", "-3p-",   # periods (NHL)
+    "-1q-", "-2q-", "-q1-", "-q2-",  # quarters
+)
+
+def _is_partial_game(slug: str) -> bool:
+    """Return True if this Polymarket slug is a partial-game (1H/period/quarter) market."""
+    s = slug.lower()
+    return any(p in s for p in _PARTIAL_GAME_SLUG_PATTERNS)
+
 SYSTEM_PROMPT = """You are Max, an expert sports researcher and betting intelligence scout.
 
 Your job is to find upcoming sports events and gather critical pre-game intelligence.
@@ -362,8 +375,15 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
         logger.info(f"[Max] Using {len(pm_events)} pre-fetched Polymarket events from runner")
 
     if pm_events:
+        # Strip partial-game markets (1H, periods, quarters) — they can't be compared
+        # against full-game sharp lines and produce false VALUE signals downstream.
+        full_game_events = [e for e in pm_events if not _is_partial_game(e.get("slug", ""))]
+        skipped = len(pm_events) - len(full_game_events)
+        if skipped:
+            logger.info(f"[Max] Filtered {skipped} partial-game market(s) (1H/period/quarter slug) — researching full-game only")
+
         pm_lines = []
-        for e in pm_events[:25]:  # top 25 by volume
+        for e in full_game_events[:25]:  # top 25 by volume
             ta = e.get("team_a", "")
             tb = e.get("team_b", "")
             prices = e.get("moneyline_prices", {})
@@ -400,7 +420,7 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
             "You MUST research the top games by volume — they are your primary candidates. "
             "Add others from web search only if you find a compelling edge not covered above."
         )
-        logger.info(f"[Max] Injecting {len(pm_events)} Polymarket events into prompt")
+        logger.info(f"[Max] Injecting {len(full_game_events)} full-game Polymarket events into prompt")
     else:
         pm_section = (
             "NOTE: Could not fetch live Polymarket markets. "
@@ -412,7 +432,7 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
     # This runs in Python before the LLM loop, so Max's entire tool budget
     # is free for form/H2H/context/lineup research — not basic injury lookups.
     logger.info("[Max] Pre-fetching injury reports for top Polymarket games...")
-    injury_section = _prefetch_injuries(pm_events, top_n=10)
+    injury_section = _prefetch_injuries(full_game_events, top_n=10)
     if injury_section:
         logger.info(f"[Max] Injury pre-fetch complete ({injury_section.count(chr(10)) + 1} lines)")
     else:
@@ -421,7 +441,7 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
     # ── Pre-fetch NBA game logs for all top-game NBA teams ───────────────────
     # Eliminates 10-14 get_nba_game_log tool calls that were hitting the per-tool cap.
     logger.info("[Max] Pre-fetching NBA game logs for top Polymarket games...")
-    nba_log_section = _prefetch_nba_game_logs(pm_events, top_n=10)
+    nba_log_section = _prefetch_nba_game_logs(full_game_events, top_n=10)
     if nba_log_section:
         logger.info(f"[Max] NBA game log pre-fetch complete ({nba_log_section.count(chr(10)) + 1} lines)")
     else:
@@ -430,7 +450,7 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
     identity_ctx = tools.load_agent_context("Max")
 
     # ── Grok pre-pass — breaking X/Twitter news ──────────────────────────────
-    grok_news = _grok_breaking_news(pm_lines if pm_events else [])
+    grok_news = _grok_breaking_news(pm_lines if full_game_events else [])
     grok_section = (
         f"\n\nBREAKING NEWS from X/Twitter (sourced by Grok — last 24h):\n{grok_news}\n\n"
         "⚠️  This Grok intelligence is more recent than ESPN reports. If Grok says a player "
