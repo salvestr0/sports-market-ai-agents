@@ -26,12 +26,12 @@ BOT_LOG    = "sports_bot.log"
 
 # Bot subprocess handle
 _bot_proc = None
-_bot_lock = threading.Lock()
+_bot_lock = threading.RLock()
 
 # Agent pipeline subprocess handle
 AGENT_LOG = "agents/runner.log"
 _agent_proc = None
-_agent_lock = threading.Lock()
+_agent_lock = threading.RLock()
 
 def agent_running() -> bool:
     global _agent_proc
