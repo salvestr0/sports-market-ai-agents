@@ -403,38 +403,17 @@ def _handle_run_command():
         batch_lock.release()
 
 
-_COMPLEX_KEYWORDS = {
-    "why", "should", "strategy", "recommend", "analyse", "analyze",
-    "compare", "think", "opinion", "improve", "change", "explain",
-    "decide", "reason", "consider", "evaluate", "assess", "suggest",
-    "advice", "better", "worse", "best", "optimal", "review",
-}
-
-def _pick_model(text: str) -> str:
-    """Haiku for simple lookups, Sonnet for reasoning/analysis."""
-    words = set(text.lower().split())
-    if len(text) > 120 or words & _COMPLEX_KEYWORDS:
-        return "claude-sonnet-4-6"
-    return "claude-haiku-4-5-20251001"
-
-
 def _handle_question(text: str):
-    """Answer a free-text question using Claude — with real tools to take action."""
-    try:
-        import anthropic
-    except ImportError:
-        _send("⚠️ anthropic package not installed. Can't answer questions.")
-        return
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        _send("⚠️ ANTHROPIC_API_KEY not set. Can't answer questions.")
+    """Answer a free-text question using Gemini 2.5 Flash — with real tools to take action."""
+    if not os.getenv("GEMINI_API_KEY"):
+        _send("⚠️ GEMINI_API_KEY not set. Can't answer questions.")
         return
     _send("🤔 <i>Thinking...</i>")
     context = _build_context_summary()
 
     from agents.tools import (
         TOOL_GET_OPEN_TRADES, TOOL_SETTLE_TRADE, TOOL_GET_LIVE_SCORES,
-        dispatch, run_agent,
+        dispatch, run_agent_gemini,
     )
 
     system = """You are the collective voice of four AI sports betting agents: Max (researcher), Nova (odds analyst), Lumi (risk assessor), and Sage (portfolio manager). You are speaking directly to your owner via Telegram.
@@ -458,15 +437,13 @@ Answer questions naturally and concisely (2-5 sentences max). Use real numbers f
 Owner's request: {text}"""
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-        answer = run_agent(
-            client=client,
-            model=_pick_model(text),
+        answer = run_agent_gemini(
             system=system,
             user_prompt=user_prompt,
             tools_schema=[TOOL_GET_OPEN_TRADES, TOOL_SETTLE_TRADE, TOOL_GET_LIVE_SCORES],
             execute_fn=dispatch,
             max_tool_calls=10,
+            model="gemini-2.5-flash",
         )
         _send(f"💬 {answer}" if answer else "💬 Done.")
     except Exception as e:
