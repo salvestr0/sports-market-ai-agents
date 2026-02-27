@@ -130,6 +130,46 @@ def run(max_report: dict, nova_report: dict, bankroll_context: dict = None) -> d
 
     now = datetime.now(timezone.utc)
 
+    # ── Fast-reject: skip LLM for obviously unviable events ─────────────────
+    # Events with BOTH low Max confidence AND sub-2% Nova edge are guaranteed
+    # ABORTs — evaluate them in Python and skip LLM time entirely.
+    fast_rejected = []
+    filtered_candidates = []
+    for c in candidates:
+        eid      = c.get("event_id", "")
+        max_conf = c.get("confidence", "")
+        nova_a   = next((a for a in analyses if a.get("event_id") == eid), None)
+        edge_pct = nova_a.get("edge", {}).get("edge_pct", 0) if nova_a else 0
+        if max_conf == "low" and edge_pct < 2.0:
+            logger.info(f"[Lumi] FAST_REJECT {eid} — confidence=low + edge={edge_pct:.1f}% < 2% threshold")
+            fast_rejected.append({
+                "event_id":     eid,
+                "risks":        [{"type": "other", "severity": "high",
+                                  "description": f"Max confidence=low with only {edge_pct:.1f}% edge — both below minimum thresholds"}],
+                "red_flags":    ["Max confidence low", f"Nova edge {edge_pct:.1f}% below 2% floor"],
+                "green_flags":  [],
+                "lumi_verdict": "ABORT",
+                "skip_reason":  "fast_reject_low_confidence_low_edge",
+            })
+        else:
+            filtered_candidates.append(c)
+
+    if fast_rejected:
+        logger.info(f"[Lumi] Fast-rejected {len(fast_rejected)} event(s) — {len(filtered_candidates)} sent to LLM")
+
+    if not filtered_candidates:
+        logger.info("[Lumi] All events fast-rejected — skipping LLM entirely")
+        result = {
+            "agent": "Lumi",
+            "generated_at": now.isoformat(),
+            "assessments": fast_rejected,
+        }
+        for a in fast_rejected:
+            logger.info(f"  {a['event_id']} | ABORT — {a['skip_reason']}")
+        return result
+
+    candidates = filtered_candidates  # LLM only sees events that need real assessment
+
     # ── Bankroll context section ─────────────────────────────────────────────
     if bankroll_context:
         total_pnl    = bankroll_context.get("total_pnl", 0)
@@ -265,6 +305,10 @@ Output ONLY the JSON object."""
                 "lumi_verdict": "PROCEED",
                 "skip_reason":  None,
             })
+
+    # Merge fast-rejected events (evaluated in Python) into final assessments
+    if fast_rejected:
+        assessments = fast_rejected + assessments
 
     counts = {"PROCEED": 0, "CAUTION": 0, "ABORT": 0}
     for a in assessments:

@@ -92,6 +92,14 @@ TOOL FAILURE PROTOCOL — follow this strictly:
 - If web_search also fails to find injury info: note "injury data unavailable" and move on. Do not stall.
 - Never call the same tool more than twice for the same team.
 
+FAIL-FAST PROTOCOL — conserve budget when an event is stuck:
+- If 2 consecutive tool calls for the SAME event return errors, empty results, or no useful content:
+  immediately set that event's max_verdict=UNCERTAIN, confidence="low", and edge_thesis="research_timeout —
+  tool calls returned no data". Move on to the next event. Do NOT keep spending calls on a stuck event.
+- A "failed" call = error response, empty list, or response with no team/game information.
+- It is far better to output 3 deeply researched events than 8 events with empty data.
+- Apply your saved budget to events that are actually returning results.
+
 RESEARCH PRIORITY ORDER — injuries are pre-fetched, so start with verification then go deep:
 1. Injuries — read the PRE-FETCHED INJURY REPORTS section in your prompt. Data is already there.
    Assign injury_impact_score (0.0–1.0) and list key_absentees from the pre-fetched data.
@@ -381,6 +389,13 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
         skipped = len(pm_events) - len(full_game_events)
         if skipped:
             logger.info(f"[Max] Filtered {skipped} partial-game market(s) (1H/period/quarter slug) — researching full-game only")
+
+        # Deprioritize NHL — consistently efficiently priced with sub-1% edges.
+        # Keep volume ordering within each group; NHL goes to the back of the queue.
+        nhl = [e for e in full_game_events if e.get("league") == "NHL"]
+        full_game_events = [e for e in full_game_events if e.get("league") != "NHL"] + nhl
+        if nhl:
+            logger.info(f"[Max] Deprioritized {len(nhl)} NHL event(s) to end of research queue")
 
         pm_lines = []
         for e in full_game_events[:25]:  # top 25 by volume
