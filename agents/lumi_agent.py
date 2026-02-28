@@ -60,7 +60,11 @@ ABORT triggers (dynamic edge thresholds — read Nova's direction_conflict and M
   - Standard game (no injury chaos, no conflict): require edge >= 5%
   - High-injury game: edge >= 3% ONLY IF injury_impact_score > 0.15 AND volume > $5,000
     (market repricing is slow on injury chaos — lower bar is justified if there is liquidity)
-  - Edge < 3% in any scenario: always ABORT
+  - Confirmed-injury exception: edge >= 2% is acceptable IF Max confidence is HIGH AND at
+    least one high-impact injury is verified ("confirmed_out" via web_search or grok_twitter)
+    AND volume > $5,000. Verified news creates genuine edge even at 2% — markets price in
+    confirmed information gradually. Do NOT apply this exception to unverified injuries.
+  - Edge < 2% in any scenario: always ABORT
 
 CAUTION triggers (note but don't abort):
   - Injury to secondary player (medium impact)

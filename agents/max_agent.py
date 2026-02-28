@@ -105,7 +105,13 @@ RESEARCH PRIORITY ORDER — injuries are pre-fetched, so start with verification
    Assign injury_impact_score (0.0–1.0) and list key_absentees from the pre-fetched data.
      0.0 = no injuries of note  |  0.3 = one starter out  |  0.6 = multiple starters / key star questionable
      1.0 = team effectively crippled
-   VERIFICATION — for any Questionable player marked HIGH impact, spend ONE web_search call:
+   GROK PRE-VERIFICATION: Before spending any web_search call, check the BREAKING NEWS section
+   above. If Grok explicitly names a player as OUT, scratched, or confirmed missing, set that
+   player's verified="confirmed_out", source="grok_twitter" — no web_search needed. Grok is
+   more current than ESPN. Only spend web_search on HIGH-impact players Grok did NOT mention.
+
+   VERIFICATION — for any Questionable player marked HIGH impact NOT already resolved by Grok,
+   spend ONE web_search call:
    Query: "[Player name] [team] game status [today's date]"
    - Confirmed OUT + coach report → verified: "confirmed_out" (changes edge thesis)
    - Coach says game-time → verified: "game_time_decision" (does not change thesis)
@@ -114,7 +120,10 @@ RESEARCH PRIORITY ORDER — injuries are pre-fetched, so start with verification
    For EPL/UCL/MMA teams (not in pre-fetched data): web_search "[Team] injury news [month year]"
 2. Recent form — NBA: read the PRE-FETCHED NBA GAME LOGS section below (no tool calls needed for top teams).
    For any NBA team NOT in that list, call get_nba_game_log (1 call per team).
-   EPL/UCL/MMA/NFL/NHL/MLB: get_recent_results for both teams (cached per sport = 1 API call total).
+   EPL/UCL: Do NOT call get_recent_results — EPL/UCL teams play weekly so the 3-day API window
+   is nearly always empty. Go directly to web_search: "[Team] last 5 EPL/UCL results [month year]".
+   EPL events only appear if confirmed on the Polymarket list above — research them only if present.
+   MMA/NFL/NHL/MLB: get_recent_results for both teams (cached per sport = 1 API call total).
    If get_recent_results returns 0 matches, web_search "[Team] last 5 results [month year]".
    Get margin of victory and HOW they won/lost — not just W/L.
 3. Head-to-head — web_search "[Team A] vs [Team B] history [month year]" — last 3-5 meetings.
@@ -365,7 +374,6 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
         sports = [
             "basketball_nba",
             "americanfootball_nfl",
-            "soccer_epl",
             "soccer_uefa_champs_league",
             "mma_mixed_martial_arts",
         ]
@@ -382,6 +390,7 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
     else:
         logger.info(f"[Max] Using {len(pm_events)} pre-fetched Polymarket events from runner")
 
+    full_game_events = []  # safe default — used by pre-fetchers outside the if block
     if pm_events:
         # Strip partial-game markets (1H, periods, quarters) — they can't be compared
         # against full-game sharp lines and produce false VALUE signals downstream.
@@ -390,12 +399,17 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
         if skipped:
             logger.info(f"[Max] Filtered {skipped} partial-game market(s) (1H/period/quarter slug) — researching full-game only")
 
-        # Deprioritize NHL — consistently efficiently priced with sub-1% edges.
-        # Keep volume ordering within each group; NHL goes to the back of the queue.
+        # Deprioritize NBA and NHL — both consistently produce sub-2% edges (efficiently priced).
+        # Keep volume ordering within each group; deprioritized leagues go to the back.
+        # They are still researched if the batch has budget — just not first.
+        nba = [e for e in full_game_events if e.get("league") == "NBA"]
         nhl = [e for e in full_game_events if e.get("league") == "NHL"]
-        full_game_events = [e for e in full_game_events if e.get("league") != "NHL"] + nhl
+        deprioritized = nba + nhl
+        full_game_events = [e for e in full_game_events if e.get("league") not in ("NBA", "NHL")] + deprioritized
+        if nba:
+            logger.info(f"[Max] Deprioritized {len(nba)} NBA event(s) to end of research queue (efficiently priced)")
         if nhl:
-            logger.info(f"[Max] Deprioritized {len(nhl)} NHL event(s) to end of research queue")
+            logger.info(f"[Max] Deprioritized {len(nhl)} NHL event(s) to end of research queue (efficiently priced)")
 
         pm_lines = []
         for e in full_game_events[:25]:  # top 25 by volume
