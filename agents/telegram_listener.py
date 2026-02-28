@@ -412,7 +412,7 @@ def _handle_question(text: str):
     context = _build_context_summary()
 
     from agents.tools import (
-        TOOL_GET_OPEN_TRADES, TOOL_SETTLE_TRADE, TOOL_GET_LIVE_SCORES,
+        TOOL_GET_OPEN_TRADES, TOOL_GET_LIVE_SCORES,
         dispatch, run_agent_gemini,
     )
 
@@ -420,14 +420,9 @@ def _handle_question(text: str):
 
 You have REAL TOOLS that let you take action — not just words:
 - get_open_trades: see all currently open bets with their IDs and details
-- settle_trade: actually mark a bet as WIN or LOSS in the database
 - get_live_scores: fetch current in-progress game scores
 
-IMPORTANT RULES:
-1. If the owner tells you a game result or asks you to settle/resolve/close a bet — call get_open_trades first to find the right trade ID, then call settle_trade immediately. Do NOT say "I'm settling it" without actually calling the tool.
-2. If they say "we won" or "that game was a win" — figure out which open bet it refers to and call settle_trade for each matching bet.
-3. Never pretend to take an action you cannot take. If in doubt, call the tool.
-4. After settling a bet, confirm the result with the actual PnL figure from the tool response.
+To settle a bet, direct the owner to use the explicit /settle <id> WIN|LOSS command — do not attempt to settle bets from free-text questions.
 
 Answer questions naturally and concisely (2-5 sentences max). Use real numbers from the context. Format using plain text + HTML bold (<b>word</b>) for key terms. No markdown."""
 
@@ -440,7 +435,7 @@ Owner's request: {text}"""
         answer = run_agent_gemini(
             system=system,
             user_prompt=user_prompt,
-            tools_schema=[TOOL_GET_OPEN_TRADES, TOOL_SETTLE_TRADE, TOOL_GET_LIVE_SCORES],
+            tools_schema=[TOOL_GET_OPEN_TRADES, TOOL_GET_LIVE_SCORES],
             execute_fn=dispatch,
             max_tool_calls=10,
             model="gemini-2.5-flash",
@@ -468,7 +463,7 @@ def _process_update(update: dict):
     # Only respond to the configured chat
     incoming_chat = str(msg.get("chat", {}).get("id", ""))
     if incoming_chat != str(CHAT_ID):
-        logger.debug(f"[TG Listener] Ignoring message from unknown chat {incoming_chat}")
+        logger.debug("[TG Listener] Ignoring message from unknown chat")
         return
     text = msg.get("text", "").strip()
     if not text:

@@ -25,13 +25,15 @@ STATUS_FILE = "sports_status.json"
 BOT_LOG    = "sports_bot.log"
 
 # Bot subprocess handle
-_bot_proc = None
-_bot_lock = threading.RLock()
+_bot_proc   = None
+_bot_log_fh = None
+_bot_lock   = threading.RLock()
 
 # Agent pipeline subprocess handle
-AGENT_LOG = "agents/runner.log"
-_agent_proc = None
-_agent_lock = threading.RLock()
+AGENT_LOG      = "agents/runner.log"
+_agent_proc    = None
+_agent_log_fh  = None
+_agent_lock    = threading.RLock()
 
 def agent_running() -> bool:
     global _agent_proc
@@ -137,15 +139,16 @@ def api_agent_logs():
 
 @app.route("/api/agent/start", methods=["POST"])
 def agent_start():
-    global _agent_proc
+    global _agent_proc, _agent_log_fh
     with _agent_lock:
         if agent_running():
             return jsonify({"ok": False, "msg": "Agent pipeline already running"})
         try:
             os.makedirs("agents", exist_ok=True)
+            _agent_log_fh = open(AGENT_LOG, "a")
             _agent_proc = subprocess.Popen(
                 [sys.executable, "-m", "agents.runner"],
-                stdout=open(AGENT_LOG, "a"),
+                stdout=_agent_log_fh,
                 stderr=subprocess.STDOUT,
             )
             return jsonify({"ok": True, "pid": _agent_proc.pid})
@@ -154,13 +157,16 @@ def agent_start():
 
 @app.route("/api/agent/stop", methods=["POST"])
 def agent_stop():
-    global _agent_proc
+    global _agent_proc, _agent_log_fh
     with _agent_lock:
         if not agent_running():
             return jsonify({"ok": False, "msg": "Agent pipeline not running"})
         try:
             _agent_proc.terminate()
             _agent_proc.wait(timeout=5)
+            if _agent_log_fh:
+                _agent_log_fh.close()
+                _agent_log_fh = None
             return jsonify({"ok": True})
         except Exception as e:
             return jsonify({"ok": False, "msg": str(e)})
@@ -184,14 +190,15 @@ def api_scraper_picks():
 
 @app.route("/api/bot/start", methods=["POST"])
 def bot_start():
-    global _bot_proc
+    global _bot_proc, _bot_log_fh
     with _bot_lock:
         if bot_running():
             return jsonify({"ok": False, "msg": "Bot already running"})
         try:
+            _bot_log_fh = open(BOT_LOG, "a")
             _bot_proc = subprocess.Popen(
                 [sys.executable, "sports_bot.py"],
-                stdout=open(BOT_LOG, "a"),
+                stdout=_bot_log_fh,
                 stderr=subprocess.STDOUT,
             )
             return jsonify({"ok": True, "pid": _bot_proc.pid})
@@ -200,14 +207,15 @@ def bot_start():
 
 @app.route("/api/bot/start-live", methods=["POST"])
 def bot_start_live():
-    global _bot_proc
+    global _bot_proc, _bot_log_fh
     with _bot_lock:
         if bot_running():
             return jsonify({"ok": False, "msg": "Bot already running"})
         try:
+            _bot_log_fh = open(BOT_LOG, "a")
             _bot_proc = subprocess.Popen(
                 [sys.executable, "sports_bot.py", "--live"],
-                stdout=open(BOT_LOG, "a"),
+                stdout=_bot_log_fh,
                 stderr=subprocess.STDOUT,
             )
             return jsonify({"ok": True, "pid": _bot_proc.pid, "mode": "LIVE"})
@@ -216,13 +224,16 @@ def bot_start_live():
 
 @app.route("/api/bot/stop", methods=["POST"])
 def bot_stop():
-    global _bot_proc
+    global _bot_proc, _bot_log_fh
     with _bot_lock:
         if not bot_running():
             return jsonify({"ok": False, "msg": "Bot not running"})
         try:
             _bot_proc.terminate()
             _bot_proc.wait(timeout=5)
+            if _bot_log_fh:
+                _bot_log_fh.close()
+                _bot_log_fh = None
             return jsonify({"ok": True})
         except Exception as e:
             return jsonify({"ok": False, "msg": str(e)})
@@ -524,6 +535,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 let refreshTimer = null;
 
+function esc(str) {
+  if (str === null || str === undefined) return '—';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
 async function fetchJSON(url) {
   try {
     const r = await fetch(url);
@@ -652,8 +673,8 @@ function updateBetsTable(bets) {
     const pnlStr = b.resolved ? `<span class="${pnlClass(pnl)}">$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</span>` : '—';
     return `<tr>
       <td style="color:var(--muted)">${ts}</td>
-      <td>${sport}</td>
-      <td>${b.selection || '—'}</td>
+      <td>${esc(sport)}</td>
+      <td>${esc(b.selection)}</td>
       <td>${fmt(b.polymarket_price, 3)}</td>
       <td>${fmt(b.edge_pct, 1)}%</td>
       <td>$${fmt(b.size_usd, 2)}</td>
@@ -675,8 +696,8 @@ function updateOpenBets(open) {
     <tbody>` + open.map(b => {
       const start = b.event_start ? b.event_start.slice(0, 16).replace('T', ' ') : '—';
       return `<tr>
-        <td>${b.league || sportLabel(b.sport)}</td>
-        <td><strong>${b.selection}</strong></td>
+        <td>${esc(b.league || sportLabel(b.sport))}</td>
+        <td><strong>${esc(b.selection)}</strong></td>
         <td>${fmt(b.polymarket_price, 3)}</td>
         <td>$${fmt(b.size_usd, 2)}</td>
         <td class="positive">${fmt(b.edge_pct, 1)}%</td>
@@ -697,19 +718,19 @@ function updateScraperPicks(picks) {
     const start = p.event_start ? p.event_start.slice(0, 16).replace('T', ' ') : '—';
     return `<div class="scraper-pick">
       <div class="pick-header">
-        <span class="badge badge-${conf}">${conf.toUpperCase()}</span>
-        <span>${p.league || '—'}</span>
+        <span class="badge badge-${esc(conf)}">${esc(conf.toUpperCase())}</span>
+        <span>${esc(p.league)}</span>
         <span style="color:var(--muted)">·</span>
-        <span>${p.home_team} vs ${p.away_team}</span>
+        <span>${esc(p.home_team)} vs ${esc(p.away_team)}</span>
       </div>
       <div style="display:flex;align-items:center;gap:12px;margin-top:4px">
         <div class="pick-prob positive">${prob}%</div>
         <div>
-          <div>Backing: <strong>${p.selection}</strong></div>
-          <div class="pick-detail">${start} UTC · ${p.market_type || 'moneyline'}</div>
+          <div>Backing: <strong>${esc(p.selection)}</strong></div>
+          <div class="pick-detail">${start} UTC · ${esc(p.market_type || 'moneyline')}</div>
         </div>
       </div>
-      ${p.notes ? `<div class="pick-detail" style="margin-top:4px;font-style:italic">${p.notes}</div>` : ''}
+      ${p.notes ? `<div class="pick-detail" style="margin-top:4px;font-style:italic">${esc(p.notes)}</div>` : ''}
     </div>`;
   }).join('');
 }
@@ -808,4 +829,4 @@ if __name__ == "__main__":
     print("  Bot logs: sports_bot.log")
     print("  DB: sports_trades.db")
     print("  Scraper: drop JSON files in scraper_data/")
-    app.run(host="0.0.0.0", port=8050, debug=False)
+    app.run(host="127.0.0.1", port=8050, debug=False)
