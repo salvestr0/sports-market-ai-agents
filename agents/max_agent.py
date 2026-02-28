@@ -45,6 +45,12 @@ _PARTIAL_GAME_SLUG_PATTERNS = (
     "-1q-", "-2q-", "-q1-", "-q2-",  # quarters
 )
 
+# Leagues whose Polymarket markets are structured as "Will [Team] win?" (Yes/No outcomes)
+# rather than "Team A vs Team B" moneylines. Nova's team-name matcher cannot resolve these,
+# so they always produce NO_MARKET. Filter them from the prompt entirely.
+_UNSUPPORTED_LEAGUES = {"EPL"}
+
+
 def _is_partial_game(slug: str) -> bool:
     """Return True if this Polymarket slug is a partial-game (1H/period/quarter) market."""
     s = slug.lower()
@@ -86,12 +92,10 @@ You have four tools:
    for every team, web search consistently returning off-topic results). Use agent_name="Max".
    Only for genuine patterns across 3+ events — not a single failed lookup.
 
-EPL RULE — read this before any LEARNINGS entry about EPL:
-EPL events that appear in the ACTIVE POLYMARKET SPORTS MARKETS list ARE valid research targets.
-Research them exactly like any UCL or MMA event — they have confirmed slugs and real volume.
-The ONLY EPL restriction: do NOT discover EPL games via web search (EPL is not in your sports list).
-Any [EPL] event you see in the Polymarket list → research it. Do not filter it out.
-This rule overrides any LEARNINGS entry suggesting EPL should be universally skipped.
+EPL RULE: EPL is not in your research scope. EPL events are filtered out before this prompt
+is built — you will never see [EPL] in the ACTIVE POLYMARKET SPORTS MARKETS list. If you
+discover EPL games via web search, ignore them entirely. They have no resolvable Polymarket
+market and will always produce NO_MARKET from Nova.
 
 TOOL FAILURE PROTOCOL — follow this strictly:
 - If get_injury_report returns found=False OR error="corrupted_data": DO NOT retry. The data is unavailable.
@@ -405,6 +409,13 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
         skipped = len(pm_events) - len(full_game_events)
         if skipped:
             logger.info(f"[Max] Filtered {skipped} partial-game market(s) (1H/period/quarter slug) — researching full-game only")
+
+        # Strip unsupported leagues (Yes/No markets — Nova can't match team names)
+        pre_filter = len(full_game_events)
+        full_game_events = [e for e in full_game_events if e.get("league") not in _UNSUPPORTED_LEAGUES]
+        unsupported_skipped = pre_filter - len(full_game_events)
+        if unsupported_skipped:
+            logger.info(f"[Max] Filtered {unsupported_skipped} unsupported-league event(s) {_UNSUPPORTED_LEAGUES} — Yes/No markets, not resolvable by Nova")
 
         # Deprioritize NBA and NHL — both consistently produce sub-2% edges (efficiently priced).
         # Keep volume ordering within each group; deprioritized leagues go to the back.
