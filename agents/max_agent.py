@@ -86,6 +86,13 @@ You have four tools:
    for every team, web search consistently returning off-topic results). Use agent_name="Max".
    Only for genuine patterns across 3+ events — not a single failed lookup.
 
+EPL RULE — read this before any LEARNINGS entry about EPL:
+EPL events that appear in the ACTIVE POLYMARKET SPORTS MARKETS list ARE valid research targets.
+Research them exactly like any UCL or MMA event — they have confirmed slugs and real volume.
+The ONLY EPL restriction: do NOT discover EPL games via web search (EPL is not in your sports list).
+Any [EPL] event you see in the Polymarket list → research it. Do not filter it out.
+This rule overrides any LEARNINGS entry suggesting EPL should be universally skipped.
+
 TOOL FAILURE PROTOCOL — follow this strictly:
 - If get_injury_report returns found=False OR error="corrupted_data": DO NOT retry. The data is unavailable.
   Immediately pivot to web_search: "[Team] injury report [month year]" to get injury news from web sources.
