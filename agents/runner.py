@@ -113,6 +113,56 @@ def _attach_slugs(candidates: list, pm_events: list) -> None:
 
 
 
+def _validate_candidates(candidates: list, pm_events: list) -> list:
+    """
+    Hard guard: reject any Max candidate that has no matching live Polymarket event.
+    Catches LLM hallucinations (historical games, training-data fixtures) regardless
+    of prompt compliance.
+
+    A candidate is valid if:
+    - Its polymarket_slug matches a pm_event slug or totals_slug (set by _attach_slugs), OR
+    - Its home/away team names fuzzy-match a pm_event (fallback for slug-less candidates)
+    """
+    valid = []
+    for c in candidates:
+        slug = c.get("polymarket_slug", "")
+        home = c.get("home_team", "")
+        away = c.get("away_team", "")
+        matched = False
+
+        # 1. Slug match — _attach_slugs already ran, so any confirmed event has a slug
+        if slug:
+            for e in pm_events:
+                if e.get("slug") == slug or e.get("totals_slug") == slug:
+                    matched = True
+                    break
+
+        # 2. Fuzzy team-name fallback (handles edge cases where slug wasn't set)
+        if not matched and home and away:
+            for e in pm_events:
+                ta, tb = e.get("team_a", ""), e.get("team_b", "")
+                if (tools._names_match(home, ta) and tools._names_match(away, tb)) or \
+                   (tools._names_match(home, tb) and tools._names_match(away, ta)):
+                    matched = True
+                    break
+
+        if matched:
+            valid.append(c)
+        else:
+            logger.warning(
+                f"[PIPELINE] REJECTED hallucinated candidate: "
+                f"{home} vs {away} (event_id={c.get('event_id', '?')}) — "
+                f"no matching live Polymarket market"
+            )
+
+    rejected = len(candidates) - len(valid)
+    if rejected:
+        logger.warning(f"[PIPELINE] Candidate validation: {len(valid)} valid, {rejected} rejected (no live market)")
+    else:
+        logger.info(f"[PIPELINE] Candidate validation: all {len(valid)} candidates confirmed against live markets")
+    return valid
+
+
 def _get_bankroll_context() -> dict:
     """
     Query sports_trades.db to build portfolio health context for Lumi.
@@ -272,6 +322,10 @@ def run_batch() -> dict:
 
     # Attach Polymarket slugs deterministically so Nova can do exact slug lookup
     _attach_slugs(candidates, pm_events)
+
+    # Hard guard: reject any candidate with no live Polymarket market (catches hallucinations)
+    candidates = _validate_candidates(candidates, pm_events)
+    max_report["candidates"] = candidates  # keep report in sync
 
     if not candidates:
         logger.info("[PIPELINE] Max found no candidates - ending batch early")

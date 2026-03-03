@@ -612,9 +612,12 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
         pm_section = (
             f"ACTIVE POLYMARKET SPORTS MARKETS RIGHT NOW (sorted by volume, highest first):\n"
             + "\n".join(pm_lines)
-            + "\n\nThese games are CONFIRMED to be tradeable on Polymarket. "
-            "You MUST research the top games by volume — they are your primary candidates. "
-            "Add others from web search only if you find a compelling edge not covered above."
+            + "\n\nThese are the ONLY games you may output as candidates. "
+            "You MUST research the top games by volume from this list. "
+            "DO NOT output candidates for any game not listed here — not from web search, "
+            "not from your training data, not from historical knowledge. "
+            "If a game is not in this list, it has no live Polymarket market and will always "
+            "produce NO_MARKET. Use web search only to research games that ARE on this list."
         )
         logger.info(f"[Max] Injecting {len(full_game_events)} full-game Polymarket events into prompt")
     else:
@@ -666,6 +669,9 @@ Sports to also cover via web search: {', '.join(sports)}
 Your task:
 1. Pick the 6-8 highest-volume matchups from the Polymarket list above. Quality over quantity —
    6 deeply researched games beats 12 shallow ones.
+   HARD RULE: Every candidate you output MUST correspond to a game in the ACTIVE POLYMARKET
+   SPORTS MARKETS list above. Do not invent event IDs, do not pull from memory, do not add
+   games discovered via web search. The event_id must encode today's date, not a historical one.
 2. Grok has already pulled breaking X/Twitter news above (if available) — absorb that first.
 3. Injuries AND NBA game logs for top games are PRE-FETCHED above. Build on them:
    - NBA: PRE-FETCHED game logs are already in your prompt — NO tool calls needed for top teams.
