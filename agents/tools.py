@@ -149,7 +149,9 @@ TOOL_WEB_SEARCH = {
     "name": "web_search",
     "description": (
         "Search the web for sports news, injury reports, team form, match previews, "
-        "and upcoming event schedules. Returns a list of results with title and content."
+        "and upcoming event schedules. Returns a list of results with title, url, and content.\n"
+        "TIP: For injury/lineup/breaking news queries, set topic='news' and time_range='day' "
+        "to get the most recent articles from the last 24 hours."
     ),
     "input_schema": {
         "type": "object",
@@ -162,6 +164,24 @@ TOOL_WEB_SEARCH = {
                 "type": "integer",
                 "description": "Maximum number of results to return (default 5)",
                 "default": 5,
+            },
+            "topic": {
+                "type": "string",
+                "description": (
+                    "Search topic filter. Use 'news' for injury reports, lineup news, "
+                    "and breaking updates (returns recent news articles). "
+                    "Use 'general' (default) for form, H2H, and historical context."
+                ),
+                "enum": ["general", "news", "finance"],
+                "default": "general",
+            },
+            "time_range": {
+                "type": "string",
+                "description": (
+                    "Filter results by recency. 'day' = last 24h (best for injury/lineup news), "
+                    "'week' = last 7 days, 'month' = last 30 days. Leave empty for no filter."
+                ),
+                "enum": ["day", "week", "month", "year"],
             },
         },
         "required": ["query"],
@@ -511,6 +531,82 @@ TOOL_GET_SPORTSDB_H2H = {
 }
 
 
+TOOL_EXTRACT_URL = {
+    "name": "extract_url",
+    "description": (
+        "Fetch and read the full text content of a specific URL using Tavily Extract. "
+        "Use this when a web_search result returns a promising article URL and the snippet "
+        "is too short to get the full picture — e.g. an ESPN injury report, a beat reporter's "
+        "article, or a team news page. Returns cleaned markdown content of the page.\n"
+        "WHEN TO USE: after web_search returns a relevant URL, call extract_url to read the "
+        "full article. Budget: no more than 5 calls per batch (each costs 1 Tavily credit).\n"
+        "REQUIRES: TAVILY_API_KEY must be set. Returns empty content if not set."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The full URL to extract content from (must start with https://)",
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Optional: your research question. Tavily uses this to rank and filter "
+                    "the most relevant chunks from the page. E.g. 'Is Jaylen Brown playing tonight?'"
+                ),
+            },
+        },
+        "required": ["url"],
+    },
+}
+
+
+def extract_url(url: str, query: str = "") -> dict:
+    """
+    Fetch full text content of a URL using Tavily Extract API.
+    Returns cleaned markdown content, or an error dict if unavailable.
+    """
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if not api_key:
+        return {"found": False, "error": "TAVILY_API_KEY not set — extract_url unavailable"}
+
+    try:
+        payload = {
+            "urls":          [url],
+            "extract_depth": "basic",
+            "format":        "markdown",
+        }
+        if query:
+            payload["query"]             = query
+            payload["chunks_per_source"] = 3  # return 3 most relevant chunks
+
+        r = requests.post(
+            "https://api.tavily.com/extract",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        results = data.get("results", [])
+        if not results:
+            failed = data.get("failed_results", [])
+            reason = failed[0].get("error", "no content returned") if failed else "no content returned"
+            return {"found": False, "url": url, "error": reason}
+
+        content = results[0].get("raw_content", "") or ""
+        return {
+            "found":   True,
+            "url":     url,
+            "content": content[:6000],  # cap at ~6k chars to avoid bloating context
+        }
+    except Exception as e:
+        logger.debug(f"[TOOLS] extract_url failed for {url}: {e}")
+        return {"found": False, "url": url, "error": str(e)}
+
+
 # ─── Name matching ─────────────────────────────────────────────────────────────
 
 def _names_match(a: str, b: str, threshold: float = 0.6) -> bool:
@@ -534,11 +630,19 @@ def _names_match(a: str, b: str, threshold: float = 0.6) -> bool:
 
 # ─── web_search ───────────────────────────────────────────────────────────────
 
-def web_search(query: str, max_results: int = 5) -> list:
-    """Search the web. Uses Tavily if TAVILY_API_KEY is set, else DuckDuckGo."""
+def web_search(query: str, max_results: int = 5, topic: str = "general", time_range: str = "") -> list:
+    """
+    Search the web. Uses Tavily if TAVILY_API_KEY is set, else DuckDuckGo.
+
+    Args:
+        query:      Search query string.
+        max_results: Max results to return (default 5).
+        topic:      'news' for breaking injury/lineup articles, 'general' for historical context.
+        time_range: 'day' | 'week' | 'month' | 'year' — filter by recency (Tavily only).
+    """
     api_key = os.getenv("TAVILY_API_KEY", "")
     if api_key:
-        results = _tavily_search(query, max_results, api_key)
+        results = _tavily_search(query, max_results, api_key, topic=topic, time_range=time_range)
         if results:
             return results
         logger.debug("[TOOLS] Tavily failed, falling back to DuckDuckGo")
@@ -547,11 +651,19 @@ def web_search(query: str, max_results: int = 5) -> list:
     return _ddg_search(query, max_results)
 
 
-def _tavily_search(query: str, max_results: int, api_key: str) -> list:
+def _tavily_search(query: str, max_results: int, api_key: str, topic: str = "general", time_range: str = "") -> list:
     try:
+        payload = {
+            "api_key":     api_key,
+            "query":       query,
+            "max_results": max_results,
+            "topic":       topic,
+        }
+        if time_range:
+            payload["time_range"] = time_range
         r = requests.post(
             "https://api.tavily.com/search",
-            json={"api_key": api_key, "query": query, "max_results": max_results},
+            json=payload,
             timeout=15,
         )
         r.raise_for_status()
@@ -559,9 +671,9 @@ def _tavily_search(query: str, max_results: int, api_key: str) -> list:
         results = []
         for item in data.get("results", [])[:max_results]:
             results.append({
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "content": (item.get("content", "") or "")[:600],
+                "title":   item.get("title", ""),
+                "url":     item.get("url", ""),
+                "content": (item.get("content", "") or "")[:800],
             })
         return results
     except Exception as e:
@@ -2295,8 +2407,15 @@ def dispatch(name: str, input_data: dict) -> dict:
         results = web_search(
             query=input_data.get("query", ""),
             max_results=input_data.get("max_results", 5),
+            topic=input_data.get("topic", "general"),
+            time_range=input_data.get("time_range", ""),
         )
         return {"results": results, "count": len(results)}
+    elif name == "extract_url":
+        return extract_url(
+            url=input_data.get("url", ""),
+            query=input_data.get("query", ""),
+        )
     elif name == "get_sharp_odds":
         return get_sharp_odds(
             sport=input_data.get("sport", ""),

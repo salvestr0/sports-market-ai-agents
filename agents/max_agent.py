@@ -121,6 +121,14 @@ You have nine tools:
    - Multi-sport H2H: get_sportsdb_h2h → web_search
    - MMA injuries / soccer injuries: web_search directly (no dedicated tool)
 
+   WEB SEARCH BEST PRACTICES:
+   - For injury/lineup/availability queries: always use topic='news' and time_range='day'
+     Example: web_search("[Player] injury status tonight", topic="news", time_range="day")
+   - For H2H history, season stats, context: use default topic='general' (no time_range)
+   - If a search result has a promising ESPN/beat-reporter URL but the snippet is only 1-2
+     sentences, call extract_url(url, query="[your question]") to read the full article.
+     This is especially valuable for injury reports where the snippet cuts off mid-sentence.
+
 9. write_lesson(agent_name, what_went_wrong, correction, rule_generated) — call ONCE before
    your final JSON if you hit a systematic issue across this batch (e.g. injury API corrupted
    for every team, web search consistently returning off-topic results). Use agent_name="Max".
@@ -131,6 +139,14 @@ You have nine tools:
     Returns over_prob, under_prob, ou_line, books_used.
     Use this when researching a totals candidate to get the sharp O/U edge.
     Budget: no more than 8 calls per batch.
+
+11. extract_url(url, query) — fetch the FULL text content of a specific URL.
+    Use this after web_search returns a relevant article URL where the snippet is too short.
+    Best for: ESPN injury reports, beat reporter articles, official team news pages.
+    Example: web_search returns "espn.com/nba/story/..." with a 2-sentence snippet →
+             call extract_url(url, query="Is [Player] playing tonight?") to read the full article.
+    Budget: no more than 5 calls per batch (costs 1 Tavily credit each — use selectively).
+    REQUIRES Tavily API key. Skip if key not set.
 
 TOTALS RESEARCH — for each game you research, if a totals (O/U) market is visible on
 Polymarket (look for "totals_slug" in the ACTIVE POLYMARKET SPORTS MARKETS list), produce a
@@ -665,6 +681,7 @@ Remember: output ONLY the JSON object as your final response. No preamble, no ex
             tools.TOOL_GET_SPORTSDB_H2H,
             tools.TOOL_WRITE_LESSON,
             tools.TOOL_GET_SHARP_ODDS_TOTALS,
+            tools.TOOL_EXTRACT_URL,
         ],
         execute_fn=tools.dispatch,
         max_tool_calls=MAX_TOOL_CALLS,
@@ -678,6 +695,7 @@ Remember: output ONLY the JSON object as your final response. No preamble, no ex
             "get_sleeper_injuries":     8,   # Sleeper — 1h bulk cache per sport
             "get_sportsdb_h2h":         6,   # TheSportsDB H2H fallback
             "get_sharp_odds_totals":    8,   # totals O/U sharp probabilities
+            "extract_url":              5,   # Tavily Extract — 1 credit/call, use selectively
             "write_lesson":             1,   # one lesson per batch max
         },
         cap_message=_cap_msg,
