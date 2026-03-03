@@ -37,6 +37,13 @@ _SUPPORTED_INJURY_SPORTS = {
     "MLB": "baseball_mlb",
 }
 
+# Sleeper sport slugs for cross-reference verification (free, no key, bulk-cached per sport)
+_SLEEPER_SPORT_MAP = {
+    "NBA": "nba",
+    "NFL": "nfl",
+    "NHL": "nhl",
+}
+
 # Partial-game Polymarket slug patterns — 1H/period/quarter markets that can't be
 # compared against full-game sharp lines. Filter these out before research.
 _PARTIAL_GAME_SLUG_PATTERNS = (
@@ -119,6 +126,26 @@ You have nine tools:
    for every team, web search consistently returning off-topic results). Use agent_name="Max".
    Only for genuine patterns across 3+ events — not a single failed lookup.
 
+10. get_sharp_odds_totals(sport, home_team, away_team) — fetch devigged Over/Under probabilities
+    from sharp sportsbooks (Pinnacle, Betfair) for a matchup's totals line.
+    Returns over_prob, under_prob, ou_line, books_used.
+    Use this when researching a totals candidate to get the sharp O/U edge.
+    Budget: no more than 8 calls per batch.
+
+TOTALS RESEARCH — for each game you research, if a totals (O/U) market is visible on
+Polymarket (look for "totals_slug" in the ACTIVE POLYMARKET SPORTS MARKETS list), produce a
+SEPARATE candidate with market_type="totals". Keep the moneyline candidate as-is; the totals
+candidate is an ADDITIONAL entry for the same game. Totals research focus:
+- Pace & scoring: both teams' PPG (last 10 games), opponent PPG allowed, pace rating
+- Injury impact on scoring: missing offensive stars → UNDER lean; missing key defenders → OVER lean
+- H2H totals: last 5 meetings — did games trend over or under the posted line?
+- Rest/fatigue: back-to-backs often produce lower-scoring games (UNDER lean)
+- Line value: compare ou_line to season averages and recent trend for this matchup
+Call get_sharp_odds_totals(sport, home_team, away_team) to get the sharp O/U probability.
+Set max_verdict = OVER_EDGE if the game is likely to go over, UNDER_EDGE if likely under.
+Only produce a totals candidate if you have a clear directional view — skip if genuinely 50-50
+or if the sport is MMA (no reliable totals line). For totals candidates, ou_line must be set.
+
 EPL RULE: EPL is not in your research scope. EPL events are filtered out before this prompt
 is built — you will never see [EPL] in the ACTIVE POLYMARKET SPORTS MARKETS list. If you
 discover EPL games via web search, ignore them entirely. They have no resolvable Polymarket
@@ -147,6 +174,11 @@ RESEARCH PRIORITY ORDER — injuries are pre-fetched, so start with verification
    above. If Grok explicitly names a player as OUT, scratched, or confirmed missing, set that
    player's verified="confirmed_out", source="grok_twitter" — no web_search needed. Grok is
    more current than ESPN. Only spend web_search on HIGH-impact players Grok did NOT mention.
+
+   SLEEPER PRE-VERIFICATION: The pre-fetched injury section marks players that appear as OUT
+   in both ESPN AND Sleeper with "✅ CONFIRMED_OUT (ESPN+Sleeper)". For those players, set
+   verified="confirmed_out", source="espn+sleeper" directly — NO web_search needed.
+   Only spend web_search on players marked "⚠️  ESPN_ONLY (unverified)" with HIGH impact.
 
    VERIFICATION — for any Questionable player marked HIGH impact NOT already resolved by Grok,
    spend ONE web_search call:
@@ -234,7 +266,9 @@ _JSON_SCHEMA = """
         "context": "<venue, rest days, travel, motivation, scheduling spot>",
         "edge_thesis": "<2-3 sentence specific reason why one side is mispriced — cite injury status (verified/unverified), form edge, rest advantage, or H2H. Do not truncate.>"
       },
-      "max_verdict": "<HOME_ADVANTAGE|AWAY_EDGE|NEUTRAL|UNCERTAIN>",
+      "market_type": "<moneyline|totals>",
+      "ou_line": null,
+      "max_verdict": "<HOME_ADVANTAGE|AWAY_EDGE|OVER_EDGE|UNDER_EDGE|NEUTRAL|UNCERTAIN>",
       "confidence": "<high|medium|low>"
     }
   ]
@@ -293,13 +327,17 @@ def _grok_breaking_news(game_lines: list) -> str:
 
 def _prefetch_injuries(pm_events: list, top_n: int = 10) -> str:
     """
-    Pre-fetch ESPN injury reports for all supported-sport teams in the top N Polymarket events.
-    Runs in Python before Max's LLM loop — frees up Max's entire tool budget for research.
+    Pre-fetch ESPN injury reports for all supported-sport teams in the top N Polymarket events,
+    then cross-reference with Sleeper to independently confirm OUT players.
+
+    Players appearing as OUT in BOTH ESPN and Sleeper are tagged CONFIRMED_OUT — Max's LLM
+    can set verified="confirmed_out" without spending a web_search call.
 
     Returns a formatted block injected into the prompt. Empty string if no supported-sport
     teams are found (e.g. all-EPL batch).
     """
-    fetched = {}  # team_name → injury dict
+    fetched = {}      # team_name → injury dict
+    team_league = {}  # team_name → league string (for Sleeper sport lookup)
 
     for e in pm_events[:top_n]:
         league = e.get("league", "")
@@ -314,12 +352,44 @@ def _prefetch_injuries(pm_events: list, top_n: int = 10) -> str:
                 fetched[team] = tools.get_injury_report(team, sport)
             except Exception as exc:
                 fetched[team] = {"found": False, "error": str(exc), "players": []}
+            team_league[team] = league
 
     if not fetched:
         return ""
 
+    # ── Sleeper cross-reference ───────────────────────────────────────────────
+    # Build a set of (player_name_lower, team_lower) confirmed OUT in Sleeper.
+    # Sleeper bulk-caches per sport — 14 NBA teams = 1 HTTP request total.
+    _SLEEPER_OUT_STATUSES = {"out", "ir", "pup-r", "dnp", "sus"}
+    sleeper_confirmed_out: set[tuple[str, str]] = set()
+
+    for team in fetched:
+        league = team_league.get(team, "")
+        sleeper_sport = _SLEEPER_SPORT_MAP.get(league)
+        if not sleeper_sport:
+            continue  # MLB has no Sleeper data — skip
+        try:
+            sl = tools.get_sleeper_injuries(team, sleeper_sport)
+            if sl.get("found"):
+                for p in sl.get("players", []):
+                    status = (p.get("injury_status") or "").lower()
+                    if status in _SLEEPER_OUT_STATUSES:
+                        name = (p.get("player") or "").lower().strip()
+                        if name:
+                            sleeper_confirmed_out.add((name, team.lower()))
+        except Exception as exc:
+            logger.debug(f"[Max] Sleeper cross-ref failed for {team}: {exc}")
+
+    confirmed_count = len(sleeper_confirmed_out)
+    if confirmed_count:
+        logger.info(f"[Max] Sleeper cross-ref: {confirmed_count} player(s) confirmed OUT in both ESPN+Sleeper")
+
+    # ── Format output block ───────────────────────────────────────────────────
     lines = [
-        "PRE-FETCHED ESPN INJURY REPORTS (already retrieved — do NOT call get_injury_report for these teams):",
+        "PRE-FETCHED INJURY REPORTS — ESPN + Sleeper cross-referenced:",
+        "  ✅ CONFIRMED_OUT (ESPN+Sleeper) = both sources agree player is OUT → set verified='confirmed_out', no web_search needed",
+        "  ⚠️  ESPN_ONLY (unverified) = ESPN only → spend 1 web_search if HIGH impact",
+        "  (Do NOT call get_injury_report for any team listed here)",
     ]
     for team, data in fetched.items():
         if not data.get("found"):
@@ -341,7 +411,16 @@ def _prefetch_injuries(pm_events: list, top_n: int = 10) -> str:
                 pos    = p.get("position", "")
                 ret    = p.get("return_date", "")
                 suffix = f", ret: {ret}" if ret and ret not in ("unknown", "") else ""
-                lines.append(f"  {team}: [{status}] {name} ({pos}{suffix})")
+                # Check Sleeper cross-reference (name-based fuzzy: strip to lower)
+                name_lower = name.lower().strip()
+                team_lower = team.lower()
+                is_sleeper_confirmed = any(
+                    name_lower in sl_name or sl_name in name_lower
+                    for (sl_name, sl_team) in sleeper_confirmed_out
+                    if sl_team == team_lower
+                )
+                tag = "✅ CONFIRMED_OUT (ESPN+Sleeper)" if is_sleeper_confirmed else "⚠️  ESPN_ONLY (unverified)"
+                lines.append(f"  {team}: [{status}] {name} ({pos}{suffix}) — {tag}")
 
     return "\n".join(lines)
 
@@ -484,8 +563,9 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
             except Exception:
                 pass
 
+            totals_marker = f' | totals_slug={e["totals_slug"]}' if e.get("totals_slug") else ""
             pm_lines.append(
-                f'  - [{league}] {teams} | vol=${vol:,.0f} | ends={end}{timing_tag} | slug={e["slug"]}'
+                f'  - [{league}] {teams} | vol=${vol:,.0f} | ends={end}{timing_tag} | slug={e["slug"]}{totals_marker}'
             )
         pm_section = (
             f"ACTIVE POLYMARKET SPORTS MARKETS RIGHT NOW (sorted by volume, highest first):\n"
@@ -584,6 +664,7 @@ Remember: output ONLY the JSON object as your final response. No preamble, no ex
             tools.TOOL_GET_SLEEPER_INJURIES,
             tools.TOOL_GET_SPORTSDB_H2H,
             tools.TOOL_WRITE_LESSON,
+            tools.TOOL_GET_SHARP_ODDS_TOTALS,
         ],
         execute_fn=tools.dispatch,
         max_tool_calls=MAX_TOOL_CALLS,
@@ -596,6 +677,7 @@ Remember: output ONLY the JSON object as your final response. No preamble, no ex
             "get_api_football_form":    8,   # API-Football form (shared quota with H2H)
             "get_sleeper_injuries":     8,   # Sleeper — 1h bulk cache per sport
             "get_sportsdb_h2h":         6,   # TheSportsDB H2H fallback
+            "get_sharp_odds_totals":    8,   # totals O/U sharp probabilities
             "write_lesson":             1,   # one lesson per batch max
         },
         cap_message=_cap_msg,

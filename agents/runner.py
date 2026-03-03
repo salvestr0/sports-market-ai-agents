@@ -87,21 +87,26 @@ def _attach_slugs(candidates: list, pm_events: list) -> None:
     """
     Deterministically attach polymarket_slug to each candidate by fuzzy-matching
     against pre-fetched pm_events. Sets slug in-place; skips if already set.
+
+    Totals candidates (market_type == "totals") get the totals_slug; moneyline
+    candidates get the standard moneyline slug.
     """
     for c in candidates:
         if c.get("polymarket_slug"):
             continue
         home = c.get("home_team", "")
         away = c.get("away_team", "")
+        is_totals = c.get("market_type") == "totals"
         for e in pm_events:
             ta = e.get("team_a", "")
             tb = e.get("team_b", "")
             if (tools._names_match(home, ta) and tools._names_match(away, tb)) or \
                (tools._names_match(home, tb) and tools._names_match(away, ta)):
-                slug = e.get("slug", "")
+                slug_key = "totals_slug" if is_totals else "slug"
+                slug = e.get(slug_key, "")
                 if slug:
                     c["polymarket_slug"] = slug
-                    logger.info(f"  [SLUGS] {home} vs {away} → {slug!r}")
+                    logger.info(f"  [SLUGS] {home} vs {away} ({c.get('market_type','moneyline')}) → {slug!r}")
                 break
 
 

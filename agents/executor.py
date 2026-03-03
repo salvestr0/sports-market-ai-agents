@@ -173,6 +173,14 @@ def _resolve_token(slug: str, selection: str) -> tuple:
         outcomes  = json.loads(m.get("outcomes", "[]")     or "[]")
         prices    = [float(p) for p in json.loads(m.get("outcomePrices", "[]") or "[]")]
 
+        # Prefix-match first for Over/Under (e.g. "Over" matches "Over 221.5")
+        sel_lower = selection.lower()
+        if sel_lower in ("over", "under"):
+            for idx, outcome in enumerate(outcomes):
+                if outcome.lower().startswith(sel_lower):
+                    if idx < len(token_ids) and idx < len(prices):
+                        return str(token_ids[idx]), prices[idx], idx, outcomes
+
         for idx, outcome in enumerate(outcomes):
             if _names_match(outcome, selection):
                 if idx < len(token_ids) and idx < len(prices):

@@ -63,13 +63,13 @@ _MAX_SANE_EDGE = {
 def _find_pm_event(home: str, away: str, pm_events: list, slug: str = "") -> dict | None:
     """
     Find the best-matching Polymarket event for a given matchup.
-    1. Exact slug match (most reliable — no fuzzy matching required).
+    1. Exact slug match against moneyline slug or totals_slug (no fuzzy matching required).
     2. Fuzzy name match fallback (handles short vs full names).
     """
-    # 1. Exact slug match
+    # 1. Exact slug match — check both moneyline slug and totals_slug
     if slug:
         for e in pm_events:
-            if e.get("slug") == slug:
+            if e.get("slug") == slug or e.get("totals_slug") == slug:
                 return e
     # 2. Fuzzy name match fallback
     for e in pm_events:
@@ -81,11 +81,151 @@ def _find_pm_event(home: str, away: str, pm_events: list, slug: str = "") -> dic
     return None
 
 
+def _compute_totals_analysis(candidate: dict, pm_events: list) -> dict:
+    """
+    Compute edge analysis for an O/U totals candidate.
+    Returns a nova_analysis dict parallel to the moneyline version.
+    """
+    event_id  = candidate.get("event_id", "?")
+    home_team = candidate.get("home_team", "")
+    away_team = candidate.get("away_team", "")
+    sport     = candidate.get("sport", "basketball_nba")
+    league    = candidate.get("league", _SPORT_TO_LEAGUE.get(sport, "?"))
+    ou_line   = candidate.get("ou_line")
+
+    base = {
+        "event_id":    event_id,
+        "home_team":   home_team,
+        "away_team":   away_team,
+        "league":      league,
+        "market_type": "totals",
+        "ou_line":     ou_line,
+    }
+
+    # ── Find pm_event for totals prices ────────────────────────────────────
+    pm_event = _find_pm_event(
+        home_team, away_team, pm_events,
+        slug=candidate.get("polymarket_slug", ""),
+    )
+    totals_prices = pm_event.get("totals_prices", {}) if pm_event else {}
+    over_pm  = next((v for k, v in totals_prices.items() if "over"  in k.lower()), None)
+    under_pm = next((v for k, v in totals_prices.items() if "under" in k.lower()), None)
+
+    if not pm_event or over_pm is None:
+        return {
+            **base,
+            "polymarket":           {"found": False, "message": f"No totals market found for {home_team} vs {away_team}"},
+            "sharp_books":          {"found": False},
+            "consensus_sharp_prob": {},
+            "edge":                 {},
+            "nova_verdict":         "NO_MARKET",
+            "unknown_reason":       "no_totals_market",
+            "notes":                f"No totals market on Polymarket for {home_team} vs {away_team}.",
+        }
+
+    pm_data = {
+        "found":       True,
+        "slug":        pm_event.get("totals_slug", ""),
+        "over_price":  round(over_pm,  4),
+        "under_price": round(under_pm, 4) if under_pm is not None else None,
+        "volume":      pm_event.get("total_volume", 0),
+    }
+
+    # ── Sharp totals odds ───────────────────────────────────────────────────
+    sharp = tools.get_sharp_odds_totals(sport, home_team, away_team)
+
+    if not sharp.get("found"):
+        reason = sharp.get("message", sharp.get("error", "no totals line posted"))
+        reason_lower = reason.lower()
+        if "not available" in reason_lower or "422" in reason:
+            unknown_reason = "sport_not_available"
+        elif "no sharp" in reason_lower or "not found" in reason_lower:
+            unknown_reason = "no_books_posted_yet"
+        else:
+            unknown_reason = "api_error"
+        return {
+            **base,
+            "polymarket":           pm_data,
+            "sharp_books":          {"found": False, "message": reason},
+            "consensus_sharp_prob": {},
+            "edge":                 {},
+            "nova_verdict":         "UNKNOWN",
+            "unknown_reason":       unknown_reason,
+            "notes":                f"No sharp totals odds ({unknown_reason}): {reason}",
+        }
+
+    sharp_over  = sharp["over_prob"]
+    sharp_under = sharp["under_prob"]
+    sharp_line  = sharp.get("ou_line") or ou_line
+
+    over_edge  = sharp_over  - over_pm
+    under_edge = sharp_under - (under_pm if under_pm is not None else 1 - over_pm)
+
+    if over_edge >= under_edge and over_edge > 0:
+        selection    = "Over"
+        best_pm      = over_pm
+        best_sharp   = sharp_over
+        best_edge_pct = over_edge * 100
+    elif under_edge > 0:
+        selection    = "Under"
+        best_pm      = under_pm if under_pm is not None else 1 - over_pm
+        best_sharp   = sharp_under
+        best_edge_pct = under_edge * 100
+    else:
+        return {
+            **base,
+            "polymarket":           pm_data,
+            "sharp_books":          {"found": True, "over_prob": sharp_over, "under_prob": sharp_under, "books_used": sharp["books_used"]},
+            "consensus_sharp_prob": {"over": sharp_over, "under": sharp_under},
+            "edge":                 {"over_edge_pct": round(over_edge * 100, 2), "under_edge_pct": round(under_edge * 100, 2)},
+            "nova_verdict":         "OVERPRICED",
+            "unknown_reason":       None,
+            "notes":                "Polymarket overprices both Over and Under. No totals edge.",
+        }
+
+    edge_data = {
+        "selection":     selection,
+        "ou_line":       sharp_line,
+        "polymarket_price": round(best_pm, 4),
+        "sharp_prob":    round(best_sharp, 4),
+        "edge_pct":      round(best_edge_pct, 2),
+        "over_edge_pct": round(over_edge * 100, 2),
+        "under_edge_pct": round(under_edge * 100, 2),
+    }
+
+    if best_edge_pct >= 5:
+        nova_verdict = "VALUE"
+        notes = f"Totals edge: {selection} at {best_pm:.0%} vs sharp {best_sharp:.0%} (+{best_edge_pct:.1f}%)"
+    else:
+        nova_verdict = "FAIR"
+        notes = f"Totals edge {best_edge_pct:.1f}% — within noise margin, not enough to bet."
+
+    logger.info(
+        f"[Nova] TOTALS {event_id}: {selection} edge {best_edge_pct:.1f}% "
+        f"| PM={best_pm:.2%} sharp={best_sharp:.2%} → {nova_verdict}"
+    )
+
+    return {
+        **base,
+        "polymarket":           pm_data,
+        "sharp_books":          {"found": True, "over_prob": sharp_over, "under_prob": sharp_under, "books_used": sharp["books_used"]},
+        "consensus_sharp_prob": {"over": round(sharp_over, 4), "under": round(sharp_under, 4)},
+        "edge":                 edge_data,
+        "nova_verdict":         nova_verdict,
+        "unknown_reason":       None,
+        "notes":                notes,
+    }
+
+
 def _compute_analysis(candidate: dict, pm_events: list) -> dict:
     """
     Compute a full odds analysis for one candidate in Python.
     Returns a nova_analysis dict ready for inclusion in the report.
     """
+    # Branch: totals candidates get their own analysis path
+    if candidate.get("market_type") == "totals":
+        return _compute_totals_analysis(candidate, pm_events)
+
     event_id  = candidate.get("event_id", "?")
     home_team = candidate.get("home_team", "")
     away_team = candidate.get("away_team", "")

@@ -188,6 +188,27 @@ TOOL_GET_SHARP_ODDS = {
     },
 }
 
+TOOL_GET_SHARP_ODDS_TOTALS = {
+    "name": "get_sharp_odds_totals",
+    "description": (
+        "Fetch devigged Over/Under probabilities from sharp sportsbooks (Pinnacle, Betfair) "
+        "for a matchup's totals (O/U) line via The Odds API. "
+        "Returns over_prob, under_prob, ou_line, and books_used."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sport": {
+                "type": "string",
+                "description": "Odds API sport key, e.g. basketball_nba, americanfootball_nfl",
+            },
+            "home_team": {"type": "string", "description": "Home team name"},
+            "away_team": {"type": "string", "description": "Away team name"},
+        },
+        "required": ["sport", "home_team", "away_team"],
+    },
+}
+
 TOOL_GET_POLYMARKET = {
     "name": "get_polymarket_market",
     "description": (
@@ -1063,6 +1084,103 @@ def get_sharp_odds(sport: str, home_team: str, away_team: str) -> dict:
     }
 
 
+# ─── get_sharp_odds_totals ────────────────────────────────────────────────────
+
+def get_sharp_odds_totals(sport: str, home_team: str, away_team: str) -> dict:
+    """
+    Fetch devigged Over/Under probabilities from sharp sportsbooks for a matchup.
+    Uses The Odds API with markets=totals.
+    Totals outcomes: {"name": "Over", "price": 1.91, "point": 221.5}
+    Returns: {found, over_prob, under_prob, ou_line, books_used}
+    """
+    api_key = os.getenv("ODDS_API_KEY", "")
+    if not api_key:
+        return {"found": False, "error": "ODDS_API_KEY not configured", "books_used": 0}
+
+    try:
+        r = requests.get(
+            f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
+            params={
+                "apiKey": api_key,
+                "regions": "us,uk,eu,au",
+                "markets": "totals",
+                "oddsFormat": "decimal",
+                "bookmakers": ",".join(SHARP_BOOKS),
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        events = r.json()
+    except requests.exceptions.HTTPError as e:
+        code = e.response.status_code if e.response else 0
+        if code == 422:
+            return {"found": False, "error": f"Sport '{sport}' totals not available", "books_used": 0}
+        return {"found": False, "error": str(e), "books_used": 0}
+    except Exception as e:
+        return {"found": False, "error": str(e), "books_used": 0}
+
+    # Find matching event
+    target = None
+    for event in events:
+        h = event.get("home_team", "")
+        a = event.get("away_team", "")
+        if (_names_match(h, home_team) and _names_match(a, away_team)) or \
+           (_names_match(a, home_team) and _names_match(h, away_team)):
+            target = event
+            break
+
+    if not target:
+        return {
+            "found": False,
+            "message": f"No totals line found for {home_team} vs {away_team} in {sport}",
+            "books_used": 0,
+        }
+
+    # Parse Over/Under per book — devig
+    over_probs = []
+    under_probs = []
+    ou_line = None
+
+    for bm in target.get("bookmakers", []):
+        for market in bm.get("markets", []):
+            if market.get("key") != "totals":
+                continue
+            outcomes = market.get("outcomes", [])
+            raw_probs = [1.0 / o["price"] for o in outcomes if o.get("price", 0) > 0]
+            total_raw = sum(raw_probs)
+            if total_raw <= 0:
+                continue
+            for o in outcomes:
+                if o.get("price", 0) <= 0:
+                    continue
+                devigged = round((1.0 / o["price"]) / total_raw, 4)
+                name = o.get("name", "").lower()
+                if "over" in name:
+                    over_probs.append(devigged)
+                    if ou_line is None and o.get("point"):
+                        ou_line = float(o["point"])
+                elif "under" in name:
+                    under_probs.append(devigged)
+
+    if not over_probs or not under_probs:
+        return {
+            "found": False,
+            "message": "Event found but no sharp totals odds available",
+            "books_used": 0,
+        }
+
+    over_consensus  = round(sum(over_probs)  / len(over_probs),  4)
+    under_consensus = round(sum(under_probs) / len(under_probs), 4)
+
+    return {
+        "found":      True,
+        "over_prob":  over_consensus,
+        "under_prob": under_consensus,
+        "ou_line":    ou_line,
+        "books_used": len(over_probs),
+    }
+
+
 # ─── get_polymarket_market ────────────────────────────────────────────────────
 
 def get_polymarket_market(home_team: str, away_team: str, sport: str = "") -> dict:
@@ -1280,6 +1398,45 @@ def fetch_polymarket_events(hours_ahead: int = 48) -> list:
                 moneyline_prices = dict(zip(outs, pl))
                 slug = m0.get("slug", "")
 
+            # ── Totals market extraction ─────────────────────────────────────
+            totals_prices = {}
+            totals_slug = ""
+            ou_line = None
+            for m in markets_raw:
+                q_t = m.get("question", "").lower()
+                if "over" not in q_t and "o/u" not in q_t and "under" not in q_t:
+                    continue
+                outs_raw = m.get("outcomes", "[]")
+                if isinstance(outs_raw, str):
+                    try:
+                        t_outs = json.loads(outs_raw)
+                    except Exception:
+                        continue
+                else:
+                    t_outs = outs_raw
+                prices_raw = m.get("outcomePrices", "[]")
+                if isinstance(prices_raw, str):
+                    try:
+                        t_prices = [float(p) for p in json.loads(prices_raw)]
+                    except Exception:
+                        continue
+                else:
+                    t_prices = [float(p) for p in prices_raw]
+                if len(t_outs) == 2 and len(t_prices) == 2:
+                    totals_prices = dict(zip(t_outs, t_prices))
+                    totals_slug = m.get("slug", "")
+                    # Extract O/U line from outcome labels or question
+                    for o in t_outs:
+                        m2 = re.search(r"(\d+\.?\d*)", o)
+                        if m2:
+                            ou_line = float(m2.group(1))
+                            break
+                    if ou_line is None:
+                        m2 = re.search(r"(\d+\.?\d*)", q_t)
+                        if m2:
+                            ou_line = float(m2.group(1))
+                    break
+
             teams = list(moneyline_prices.keys())
             event_dict = {
                 "league":           league,
@@ -1290,6 +1447,9 @@ def fetch_polymarket_events(hours_ahead: int = 48) -> list:
                 "moneyline_prices": moneyline_prices,
                 "total_volume":     total_vol,
                 "slug":             slug,
+                "totals_prices":    totals_prices,
+                "totals_slug":      totals_slug,
+                "ou_line":          ou_line,
                 "markets":          markets_raw,
             }
             all_events.append(event_dict)
@@ -2139,6 +2299,12 @@ def dispatch(name: str, input_data: dict) -> dict:
         return {"results": results, "count": len(results)}
     elif name == "get_sharp_odds":
         return get_sharp_odds(
+            sport=input_data.get("sport", ""),
+            home_team=input_data.get("home_team", ""),
+            away_team=input_data.get("away_team", ""),
+        )
+    elif name == "get_sharp_odds_totals":
+        return get_sharp_odds_totals(
             sport=input_data.get("sport", ""),
             home_team=input_data.get("home_team", ""),
             away_team=input_data.get("away_team", ""),

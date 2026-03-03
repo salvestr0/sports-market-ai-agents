@@ -2,6 +2,10 @@
 
 A 4-agent AI pipeline that finds value bets on [Polymarket](https://polymarket.com) sports prediction markets. Agents research upcoming events, compare odds against sharp bookmakers, assess risk, and make final BET/SKIP decisions — all autonomously.
 
+Supports two market types per game:
+- **Moneyline** — which team wins
+- **Over/Under (totals)** — whether the combined score goes over or under the posted line
+
 ---
 
 ## How It Works
@@ -10,12 +14,12 @@ The pipeline runs four agents in sequence:
 
 | Agent | Model | Role |
 |-------|-------|------|
-| **Max** | Gemini 2.5 Flash | Researches upcoming sports events, injuries, form, and news |
-| **Nova** | Gemini 2.5 Flash | Fetches sharp book odds (Pinnacle/Betfair via The Odds API) and calculates edge vs Polymarket prices |
+| **Max** | Gemini 2.5 Flash | Researches upcoming sports events, injuries, form, news. Produces both moneyline and totals candidates per game. |
+| **Nova** | Gemini 2.5 Flash | Fetches sharp book odds (Pinnacle/Betfair via The Odds API) and calculates edge vs Polymarket prices — for both moneyline and O/U markets |
 | **Lumi** | Gemini 2.5 Flash | Devil's advocate risk assessor — challenges every pick |
 | **Sage** | Claude Sonnet | Final decision maker — writes approved picks for execution |
 
-Picks are executed by `sports_bot.py` via Polymarket's CLOB API using limit orders (0% maker fee).
+Picks are executed immediately by the inline executor via Polymarket's CLOB API using limit orders (0% maker fee).
 
 ---
 
@@ -32,26 +36,33 @@ Picks are executed by `sports_bot.py` via Polymarket's CLOB API using limit orde
 
 ```
 agents/runner.py          — Pipeline orchestrator (manual /run trigger via Telegram)
-agents/max_agent.py       — Research agent (web search, injuries, recent form)
-agents/nova_agent.py      — Odds analysis (sharp book vs Polymarket edge calc)
+agents/max_agent.py       — Research agent (web search, injuries, form, totals analysis)
+agents/nova_agent.py      — Odds analysis (moneyline + totals edge calc vs sharp books)
 agents/lumi_agent.py      — Risk assessment (bankroll health, red flags)
 agents/sage_agent.py      — Final BET/SKIP decisions, writes pick files
+agents/executor.py        — Inline CLOB execution (placed immediately after Sage approves)
 agents/tools.py           — Shared tools: web search, odds API, Polymarket lookup
 agents/telegram_listener.py — Two-way Telegram interface (/run, /status, Q&A)
 agents/notifier.py        — Telegram notifications
-sports_bot.py             — Executes picks via Polymarket CLOB API
 sports_server.py          — Web dashboard (localhost:8050)
 ```
 
 **Pick flow:**
 ```
 /run (Telegram)
-  → Max researches events
-  → Nova checks sharp odds + calculates edge
+  → Max researches events → produces moneyline + totals candidates per game
+  → Nova checks sharp odds + calculates edge (h2h and O/U markets separately)
   → Lumi challenges each pick
   → Sage writes approved picks → scraper_data/agents_{ts}.json
-  → sports_bot.py executes via Polymarket CLOB
+  → executor.py places CLOB limit orders immediately
 ```
+
+**Market types:**
+
+| Market | Selection | Sharp data source |
+|--------|-----------|-------------------|
+| Moneyline | Team name | Odds API `h2h` market |
+| Over/Under | "Over" or "Under" | Odds API `totals` market |
 
 ---
 
@@ -133,10 +144,11 @@ Questions are automatically routed to Haiku (simple lookups) or Sonnet (analysis
 ## Sizing & Risk
 
 - **Kelly criterion** — 25% fractional Kelly, capped at $25/bet
-- **Min edge** — 5% edge required (sharp book vs Polymarket)
-- **Model probability** — >= 0.55 required
+- **Min edge** — 5% edge required (sharp book vs Polymarket) for both moneyline and totals
+- **Duplicate guard** — no repeat bets on the same slug + selection in the same session
 - **Event timing** — only bets 0.25–48h before event start
 - **Limit orders** — 0% maker fee on Polymarket CLOB
+- **Totals** — Over/Under edge computed from devigged Pinnacle/Betfair totals lines
 
 ---
 
