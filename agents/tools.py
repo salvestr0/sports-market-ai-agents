@@ -1460,6 +1460,8 @@ def fetch_polymarket_events(hours_ahead: int = 48) -> list:
             moneyline = None
             moneyline_prices = {}
             slug = ""
+            home_win_slug = ""   # EPL: per-team Yes/No win market slug
+            away_win_slug = ""   # EPL: per-team Yes/No win market slug
             for m in markets_raw:
                 outs_raw = m.get("outcomes", "[]")
                 if isinstance(outs_raw, str):
@@ -1487,6 +1489,53 @@ def fetch_polymarket_events(hours_ahead: int = 48) -> list:
                         moneyline_prices = dict(zip(outs, prices_list))
                         slug = m.get("slug", "")
                         break
+
+            # ── EPL-specific: parse Yes/No win markets ────────────────────────────
+            # EPL uses 3 separate binary markets ("Will [team] win?", draw?)
+            # rather than a standard team-vs-team binary. Extract the Yes price
+            # from each team's win market and synthesize a moneyline_prices dict.
+            if league == "EPL" and not moneyline_prices and " vs. " in title:
+                home_team_name = title.split(" vs. ", 1)[0].strip()
+                away_team_name = title.split(" vs. ", 1)[1].strip()
+                _home_yes_price = None
+                _away_yes_price = None
+                for m in markets_raw:
+                    q = m.get("question", "")
+                    q_lower = q.lower()
+                    if "draw" in q_lower or "end in" in q_lower:
+                        continue
+                    outs_raw_m = m.get("outcomes", "[]")
+                    if isinstance(outs_raw_m, str):
+                        try:
+                            outs_m = json.loads(outs_raw_m)
+                        except Exception:
+                            continue
+                    else:
+                        outs_m = list(outs_raw_m)
+                    if "Yes" not in outs_m:
+                        continue
+                    prices_raw_m = m.get("outcomePrices", "[]")
+                    if isinstance(prices_raw_m, str):
+                        try:
+                            pl_m = [float(p) for p in json.loads(prices_raw_m)]
+                        except Exception:
+                            continue
+                    else:
+                        pl_m = [float(p) for p in prices_raw_m]
+                    if len(pl_m) != len(outs_m):
+                        continue
+                    yes_idx = outs_m.index("Yes")
+                    yes_price = pl_m[yes_idx]
+                    m_slug = m.get("slug", "")
+                    if home_team_name.lower() in q_lower:
+                        _home_yes_price = yes_price
+                        home_win_slug = m_slug
+                    elif away_team_name.lower() in q_lower:
+                        _away_yes_price = yes_price
+                        away_win_slug = m_slug
+                if _home_yes_price is not None and _away_yes_price is not None:
+                    moneyline_prices = {home_team_name: _home_yes_price, away_team_name: _away_yes_price}
+                    slug = home_win_slug  # arbitrary default; Nova overrides per edge direction
 
             if not moneyline_prices and markets_raw:
                 # Fallback: just use first market's outcomes
@@ -1562,6 +1611,8 @@ def fetch_polymarket_events(hours_ahead: int = 48) -> list:
                 "totals_prices":    totals_prices,
                 "totals_slug":      totals_slug,
                 "ou_line":          ou_line,
+                "home_win_slug":    home_win_slug,
+                "away_win_slug":    away_win_slug,
                 "markets":          markets_raw,
             }
             all_events.append(event_dict)

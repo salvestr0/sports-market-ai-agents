@@ -67,7 +67,8 @@ For BET decisions, populate the pick with:
   - polymarket_slug: from Nova's polymarket.slug
   - market_type: "moneyline" or "totals" (from Max's candidate)
   - ou_line: populate for totals picks (from Max's candidate ou_line field); null for moneyline
-  - selection: for totals picks, set to "Over" or "Under" (from Nova's edge.selection)
+  - selection: for totals picks, set to "Over" or "Under" (from Nova's edge.selection);
+    for EPL Yes/No markets, set to "Yes" (from Nova's edge.selection — the outcome to buy)
 
 Self-learning: After making decisions, check for patterns worth recording:
   - If you see a recurring skip reason across 3+ events (e.g. all lumi_abort, or all edge_low <3%),
@@ -90,7 +91,7 @@ _PICK_SCHEMA = """
       "away_team": "<Full Name>",
       "market_type": "<moneyline|totals>",
       "ou_line": null,
-      "selection": "<team name | Over | Under>",
+      "selection": "<team name | Over | Under | Yes>",
       "model_probability": 0.66,
       "confidence": "<high|medium|low>",
       "notes": "<Max thesis. Nova: X% edge vs Pinnacle. Lumi: [key risk if CAUTION]>",

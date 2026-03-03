@@ -52,10 +52,9 @@ _PARTIAL_GAME_SLUG_PATTERNS = (
     "-1q-", "-2q-", "-q1-", "-q2-",  # quarters
 )
 
-# Leagues whose Polymarket markets are structured as "Will [Team] win?" (Yes/No outcomes)
-# rather than "Team A vs Team B" moneylines. Nova's team-name matcher cannot resolve these,
-# so they always produce NO_MARKET. Filter them from the prompt entirely.
-_UNSUPPORTED_LEAGUES = {"EPL"}
+# Leagues whose Polymarket markets cannot be supported (placeholder for future use).
+# EPL was previously here but now uses per-team Yes/No win markets parsed in tools.py.
+_UNSUPPORTED_LEAGUES: set = set()
 
 
 def _is_partial_game(slug: str) -> bool:

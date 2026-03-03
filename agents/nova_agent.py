@@ -262,6 +262,9 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
             "message": f"No Polymarket market found for {home_team} vs {away_team}",
         }
 
+    # EPL Yes/No markets have per-team slugs; detect so we can route correctly later
+    is_epl = pm_event is not None and bool(pm_event.get("home_win_slug"))
+
     # ── Slug audit: reject partial-game markets before fetching sharp odds ───
     # Partial-game slugs (1H, periods, quarters) produce garbage edges when
     # compared against full-game sharp probabilities — reject immediately.
@@ -357,6 +360,18 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
             best_sharp_prob = away_sharp
             best_edge_pct   = away_edge * 100
 
+        # ── EPL: route to per-team win slug ──────────────────────────────────
+        # EPL markets are 3 separate Yes/No binaries (home win / draw / away win).
+        # We've been comparing prices correctly (home_win_price vs sharp home_prob),
+        # but the slug we need to bet is the *winning side's* individual market slug.
+        if is_epl:
+            win_slug = (
+                pm_event.get("home_win_slug") if best_side == "home"
+                else pm_event.get("away_win_slug")
+            )
+            if win_slug:
+                pm_data["slug"] = win_slug
+
         # ── Direction conflict check ─────────────────────────────────────────
         # Flag when Max's verdict points to the opposite side from Nova's best edge
         max_verdict = candidate.get("max_verdict", "NEUTRAL")
@@ -382,7 +397,8 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
                 logger.warning(f"[Nova] DIRECTION CONFLICT — {event_id}: {conflict_note}")
 
         edge_data = {
-            "selection":        best_team,
+            "selection":        "Yes" if is_epl else best_team,
+            "backing":          best_team,  # human-readable team name regardless of market structure
             "side":             best_side,
             "polymarket_price": round(best_poly_price, 4),
             "sharp_prob":       round(best_sharp_prob, 4),
