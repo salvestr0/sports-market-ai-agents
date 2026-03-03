@@ -147,24 +147,47 @@ You have nine tools:
     Budget: no more than 5 calls per batch (costs 1 Tavily credit each — use selectively).
     REQUIRES Tavily API key. Skip if key not set.
 
-TOTALS RESEARCH — for each game you research, if a totals (O/U) market is visible on
-Polymarket (look for "totals_slug" in the ACTIVE POLYMARKET SPORTS MARKETS list), produce a
-SEPARATE candidate with market_type="totals". Keep the moneyline candidate as-is; the totals
-candidate is an ADDITIONAL entry for the same game. Totals research focus:
-- Pace & scoring: both teams' PPG (last 10 games), opponent PPG allowed, pace rating
-- Injury impact on scoring: missing offensive stars → UNDER lean; missing key defenders → OVER lean
-- H2H totals: last 5 meetings — did games trend over or under the posted line?
-- Rest/fatigue: back-to-backs often produce lower-scoring games (UNDER lean)
-- Line value: compare ou_line to season averages and recent trend for this matchup
-Call get_sharp_odds_totals(sport, home_team, away_team) to get the sharp O/U probability.
-Set max_verdict = OVER_EDGE if the game is likely to go over, UNDER_EDGE if likely under.
-Only produce a totals candidate if you have a clear directional view — skip if genuinely 50-50
-or if the sport is MMA (no reliable totals line). For totals candidates, ou_line must be set.
+TOTALS RESEARCH — for each game, if a totals (O/U) market is visible on Polymarket
+(look for "totals_slug" in the ACTIVE POLYMARKET SPORTS MARKETS list), produce a SEPARATE
+candidate with market_type="totals". Keep the moneyline candidate as-is; the totals candidate
+is an ADDITIONAL entry for the same game.
 
-EPL RULE: EPL is not in your research scope. EPL events are filtered out before this prompt
-is built — you will never see [EPL] in the ACTIVE POLYMARKET SPORTS MARKETS list. If you
-discover EPL games via web search, ignore them entirely. They have no resolvable Polymarket
-market and will always produce NO_MARKET from Nova.
+For EVERY totals candidate, research the historical O/U tendency of this specific matchup.
+Your goal is to determine: based on how these two teams score against each other and in general,
+is this game likely to go OVER or UNDER the posted line?
+
+NBA totals research:
+- PRE-FETCHED game logs show combined_total for each recent game — compare to the current
+  ou_line immediately (e.g. "5 of last 5 games went over 225.5 → strong OVER lean").
+- web_search "[Team A] over under record 2025 site:teamrankings.com" for season O/U %.
+- web_search "[Team A] vs [Team B] over under history" for H2H totals trend.
+- web_search "[Team A] [Team B] pace possessions per game" — fast-paced matchups push totals up.
+- Back-to-back games suppress scoring (UNDER lean). Check schedule context.
+
+EPL / UCL totals research:
+- Call get_recent_results(sport, team) for BOTH teams — each result includes both teams' scores,
+  so compute combined_total = home_score + away_score for each game. Compare to ou_line.
+- Call get_api_football_h2h(home_team, away_team, league) — H2H match scores show whether
+  meetings between these teams historically produce high or low combined totals.
+- web_search "[Team A] [Team B] goals prediction [month year]" for analyst previews.
+- EPL lines are typically 2.5 or 3.5 goals. Defensive teams push towards Under.
+
+NHL / MLB totals research:
+- Call get_recent_results(sport, team) for both teams — compute combined totals from scores.
+- web_search "[Team A] vs [Team B] totals prediction [month year]" for sharp analysis.
+
+ALL SPORTS — key factors:
+- H2H trend: if 4 of last 5 meetings went over → OVER lean. State the actual totals (e.g. 4.2, 3.0, 2.5 goals).
+- Season O/U record: team going 35-15 to the Over is a structural signal — mention the record.
+- Injury impact: missing offensive stars → UNDER; missing key defenders → OVER.
+- Pace / tempo: high-pace matchup → OVER; low-pace, defensive matchup → UNDER.
+- Home/away: some teams score far more at home — factor in venue.
+
+After research, call get_sharp_odds_totals(sport, home_team, away_team) to get sharp probability.
+Set max_verdict = OVER_EDGE if evidence favours Over, UNDER_EDGE if Under.
+Only produce a totals candidate if you have a CLEAR directional view backed by at least 2
+data points (e.g. H2H trend + pace context, or season O/U record + injury impact).
+Skip if genuinely 50-50 or sport is MMA (no reliable totals line).
 
 TOOL FAILURE PROTOCOL — follow this strictly:
 - If get_injury_report returns found=False OR error="corrupted_data": DO NOT retry. The data is unavailable.
@@ -485,7 +508,11 @@ def _prefetch_nba_game_logs(pm_events: list, top_n: int = 10) -> str:
             matchup = g.get("matchup", "?")
             result  = g.get("result", "?")
             pts     = g.get("pts_scored", "?")
-            lines.append(f"    {date}: {matchup} — {result} ({pts}pts)")
+            opp     = g.get("opp_pts")
+            total   = g.get("combined_total")
+            total_str = f" | total={total}" if total is not None else ""
+            score_str = f"{pts}-{opp}" if opp is not None else f"{pts}pts"
+            lines.append(f"    {date}: {matchup} — {result} ({score_str}{total_str})")
 
     return "\n".join(lines)
 

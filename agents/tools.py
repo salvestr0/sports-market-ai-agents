@@ -826,10 +826,11 @@ def get_nba_game_log(team_name: str, num_games: int = 5) -> dict:
         return {"found": False, "error": "No game log rows returned"}
 
     try:
-        idx_date    = col_headers.index("GAME_DATE")
-        idx_matchup = col_headers.index("MATCHUP")
-        idx_wl      = col_headers.index("WL")
-        idx_pts     = col_headers.index("PTS")
+        idx_date      = col_headers.index("GAME_DATE")
+        idx_matchup   = col_headers.index("MATCHUP")
+        idx_wl        = col_headers.index("WL")
+        idx_pts       = col_headers.index("PTS")
+        idx_plusminus = col_headers.index("PLUS_MINUS") if "PLUS_MINUS" in col_headers else None
     except ValueError as e:
         return {"found": False, "error": f"Unexpected API columns: {e}"}
 
@@ -838,13 +839,27 @@ def get_nba_game_log(team_name: str, num_games: int = 5) -> dict:
         matchup   = row[idx_matchup]  # e.g. "HOU vs. LAL" or "HOU @ LAL"
         is_home   = " vs. " in matchup
         opponent  = matchup.split(" vs. ")[-1] if is_home else matchup.split(" @ ")[-1]
+        pts = row[idx_pts]
+        # Compute opponent pts and combined total via PLUS_MINUS:
+        # PLUS_MINUS = team_pts - opp_pts  →  opp_pts = team_pts - PLUS_MINUS
+        opp_pts = None
+        combined_total = None
+        if idx_plusminus is not None:
+            try:
+                pm = float(row[idx_plusminus])
+                opp_pts = int(round(float(pts) - pm))
+                combined_total = int(pts) + opp_pts
+            except (TypeError, ValueError):
+                pass
         games.append({
-            "date":       row[idx_date],
-            "matchup":    matchup,
-            "home_away":  "home" if is_home else "away",
-            "opponent":   opponent.strip(),
-            "result":     row[idx_wl],
-            "pts_scored": row[idx_pts],
+            "date":           row[idx_date],
+            "matchup":        matchup,
+            "home_away":      "home" if is_home else "away",
+            "opponent":       opponent.strip(),
+            "result":         row[idx_wl],
+            "pts_scored":     pts,
+            "opp_pts":        opp_pts,
+            "combined_total": combined_total,
         })
 
     wins   = sum(1 for g in games if g["result"] == "W")

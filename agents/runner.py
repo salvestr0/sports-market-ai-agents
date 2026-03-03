@@ -65,6 +65,7 @@ _last_self_review: float = 0.0      # epoch seconds; 0 = never run
 SPORTS = [
     "basketball_nba",
     "americanfootball_nfl",
+    "soccer_epl",
     "soccer_uefa_champs_league",
     "mma_mixed_martial_arts",
 ]
