@@ -67,6 +67,8 @@ SPORTS = [
     "americanfootball_nfl",
     "soccer_epl",
     "soccer_uefa_champs_league",
+    "icehockey_nhl",
+    "baseball_mlb",
     "mma_mixed_martial_arts",
 ]
 

@@ -577,8 +577,25 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
         if nhl:
             logger.info(f"[Max] Deprioritized {len(nhl)} NHL event(s) to end of research queue (efficiently priced)")
 
+        # Hard slot caps per league — enforced in Python, not prompt-dependent.
+        # NBA/NHL are efficiently priced; cap their slots so non-NBA markets
+        # always dominate the prompt even on heavy NBA schedule days.
+        _LEAGUE_SLOT_CAPS = {"NBA": 2, "NHL": 3}
+        _league_counts: dict = {}
+
+        # Leagues where Polymarket has NO totals markets — suppress totals_slug display
+        # so Max never wastes a candidate slot on an O/U market that can't exist.
+        _NO_TOTALS_LEAGUES = {"NBA", "NHL", "MMA"}
+
         pm_lines = []
-        for e in full_game_events[:25]:  # top 25 by volume
+        for e in full_game_events[:40]:  # scan more events to fill non-NBA slots
+            league = e.get("league", "")
+            cap = _LEAGUE_SLOT_CAPS.get(league)
+            if cap is not None:
+                if _league_counts.get(league, 0) >= cap:
+                    continue
+                _league_counts[league] = _league_counts.get(league, 0) + 1
+
             ta = e.get("team_a", "")
             tb = e.get("team_b", "")
             prices = e.get("moneyline_prices", {})
@@ -586,7 +603,6 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
             pb = prices.get(tb, 0)
             teams = f'{ta} ({pa:.0%}) vs {tb} ({pb:.0%})' if ta and tb else e.get("title", "")[:80]
             vol = e.get("total_volume", 0)
-            league = e.get("league", "")
             end = e.get("end_date", "")[:16]
 
             # Time-to-tip: markets close ~2h after game ends; estimate start from end_date
@@ -605,19 +621,31 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
             except Exception:
                 pass
 
-            totals_marker = f' | totals_slug={e["totals_slug"]}' if e.get("totals_slug") else ""
+            # Only show totals_slug for leagues that actually have O/U markets on Polymarket
+            if league not in _NO_TOTALS_LEAGUES and e.get("totals_slug"):
+                totals_marker = f' | totals_slug={e["totals_slug"]}'
+            else:
+                totals_marker = ""
+
             pm_lines.append(
                 f'  - [{league}] {teams} | vol=${vol:,.0f} | ends={end}{timing_tag} | slug={e["slug"]}{totals_marker}'
             )
+        nba_shown = _league_counts.get("NBA", 0)
+        nhl_shown = _league_counts.get("NHL", 0)
+        cap_note = ""
+        if nba_shown:
+            cap_note += f" NBA is capped at {nba_shown} slot(s) — efficiently priced, low edge historically."
+        if nhl_shown:
+            cap_note += f" NHL is capped at {nhl_shown} slot(s)."
         pm_section = (
             f"ACTIVE POLYMARKET SPORTS MARKETS RIGHT NOW (sorted by volume, highest first):\n"
             + "\n".join(pm_lines)
-            + "\n\nThese are the ONLY games you may output as candidates. "
-            "You MUST research the top games by volume from this list. "
+            + f"\n\nThese are the ONLY games you may output as candidates.{cap_note} "
             "DO NOT output candidates for any game not listed here — not from web search, "
             "not from your training data, not from historical knowledge. "
-            "If a game is not in this list, it has no live Polymarket market and will always "
-            "produce NO_MARKET. Use web search only to research games that ARE on this list."
+            "Markets without a totals_slug have NO Over/Under market on Polymarket — "
+            "do NOT produce totals candidates for those events. "
+            "Use web search only to research games that ARE on this list."
         )
         logger.info(f"[Max] Injecting {len(full_game_events)} full-game Polymarket events into prompt")
     else:
