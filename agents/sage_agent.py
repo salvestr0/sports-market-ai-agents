@@ -6,7 +6,7 @@ Approved picks are written to scraper_data/ in sports_bot.py format for executio
 
 Decision rules:
   BET when ALL of:
-    - Nova verdict == VALUE (edge >= 5%)
+    - Nova verdict == VALUE (edge >= 5%, or >= 3% when Max conviction aligned)
     - Lumi verdict != ABORT
     - Max confidence != low
     - Polymarket market found
@@ -38,7 +38,10 @@ You synthesize Max's research, Nova's odds analysis, and Lumi's risk assessment 
 
 Your decision rules are strict:
   BET requires ALL of the following:
-    1. Nova verdict == VALUE (minimum 5% edge vs sharp books)
+    1. Nova verdict == VALUE
+       - Standard threshold: 5% edge vs sharp books
+       - Reduced threshold: 3% edge when Nova's edge.conviction_aligned == true
+         (Max's directional lean independently confirmed Nova's best-edge side)
     2. Lumi verdict is PROCEED or CAUTION (not ABORT)
     3. Max verdict is not UNCERTAIN and Max confidence is not "low"
     4. Polymarket market was found (nova polymarket.found == true)
@@ -48,6 +51,9 @@ Your decision rules are strict:
     - Lumi: ABORT
     - Max: UNCERTAIN or confidence == "low"
     - No Polymarket market found
+
+  When Nova edge.conviction_aligned == true and edge_pct is 3-5%, apply extra scrutiny:
+  check Lumi's assessment carefully and cap confidence at "medium" even if Max said "high".
 
   IMPORTANT: If an event has no Lumi assessment in the report, treat it as Lumi = PROCEED.
   Missing Lumi assessment is NOT a reason to skip — only an explicit ABORT blocks a bet.

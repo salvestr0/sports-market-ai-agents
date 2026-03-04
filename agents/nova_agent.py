@@ -183,26 +183,46 @@ def _compute_totals_analysis(candidate: dict, pm_events: list) -> dict:
             "notes":                "Polymarket overprices both Over and Under. No totals edge.",
         }
 
+    # ── Dynamic threshold: lower bar when Max conviction aligns with Nova's direction ──
+    # Standard: 5% edge required.
+    # Aligned high/medium conviction (e.g. Max=OVER_EDGE, Nova picks Over): 3% sufficient.
+    # Rationale: Max's independent research confirming the same direction is a second signal
+    # that the mispricing is real, not statistical noise.
+    max_conviction = candidate.get("max_verdict", "NEUTRAL")
+    max_conf       = candidate.get("confidence", "medium")
+    conv_aligned   = (
+        (max_conviction == "OVER_EDGE"  and selection == "Over") or
+        (max_conviction == "UNDER_EDGE" and selection == "Under")
+    )
+    if conv_aligned and max_conf in ("high", "medium"):
+        value_threshold = 3.0
+        threshold_tag   = f" [3% threshold — Max={max_conviction}/{max_conf} aligned]"
+    else:
+        value_threshold = 5.0
+        threshold_tag   = ""
+
     edge_data = {
-        "selection":     selection,
-        "ou_line":       sharp_line,
-        "polymarket_price": round(best_pm, 4),
-        "sharp_prob":    round(best_sharp, 4),
-        "edge_pct":      round(best_edge_pct, 2),
-        "over_edge_pct": round(over_edge * 100, 2),
-        "under_edge_pct": round(under_edge * 100, 2),
+        "selection":          selection,
+        "ou_line":            sharp_line,
+        "polymarket_price":   round(best_pm, 4),
+        "sharp_prob":         round(best_sharp, 4),
+        "edge_pct":           round(best_edge_pct, 2),
+        "over_edge_pct":      round(over_edge * 100, 2),
+        "under_edge_pct":     round(under_edge * 100, 2),
+        "value_threshold":    value_threshold,
+        "conviction_aligned": conv_aligned and max_conf in ("high", "medium"),
     }
 
-    if best_edge_pct >= 5:
+    if best_edge_pct >= value_threshold:
         nova_verdict = "VALUE"
-        notes = f"Totals edge: {selection} at {best_pm:.0%} vs sharp {best_sharp:.0%} (+{best_edge_pct:.1f}%)"
+        notes = f"Totals edge: {selection} at {best_pm:.0%} vs sharp {best_sharp:.0%} (+{best_edge_pct:.1f}%){threshold_tag}"
     else:
         nova_verdict = "FAIR"
-        notes = f"Totals edge {best_edge_pct:.1f}% — within noise margin, not enough to bet."
+        notes = f"Totals edge {best_edge_pct:.1f}% — below {value_threshold:.0f}% threshold (Max conviction not aligned)."
 
     logger.info(
         f"[Nova] TOTALS {event_id}: {selection} edge {best_edge_pct:.1f}% "
-        f"| PM={best_pm:.2%} sharp={best_sharp:.2%} → {nova_verdict}"
+        f"| threshold={value_threshold:.0f}% | PM={best_pm:.2%} sharp={best_sharp:.2%} → {nova_verdict}"
     )
 
     return {
@@ -396,30 +416,45 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
             if direction_conflict:
                 logger.warning(f"[Nova] DIRECTION CONFLICT — {event_id}: {conflict_note}")
 
+        # ── Dynamic threshold: lower bar when Max conviction aligns with Nova's direction ──
+        # Standard: 5% edge required.
+        # Aligned high/medium conviction (e.g. Max=HOME_ADVANTAGE, Nova picks home): 3% sufficient.
+        max_conviction = candidate.get("max_verdict", "NEUTRAL")
+        max_conf       = candidate.get("confidence", "medium")
+        conv_aligned   = (
+            (max_conviction == "HOME_ADVANTAGE" and best_side == "home") or
+            (max_conviction == "AWAY_EDGE"      and best_side == "away")
+        )
+        if conv_aligned and max_conf in ("high", "medium"):
+            value_threshold = 3.0
+            threshold_tag   = f" [3% threshold — Max={max_conviction}/{max_conf} aligned]"
+        else:
+            value_threshold = 5.0
+            threshold_tag   = ""
+
         edge_data = {
-            "selection":        "Yes" if is_epl else best_team,
-            "backing":          best_team,  # human-readable team name regardless of market structure
-            "side":             best_side,
-            "polymarket_price": round(best_poly_price, 4),
-            "sharp_prob":       round(best_sharp_prob, 4),
-            "edge_pct":         round(best_edge_pct, 2),
-            "home_edge_pct":    round(home_edge * 100, 2),
-            "away_edge_pct":    round(away_edge * 100, 2),
+            "selection":          "Yes" if is_epl else best_team,
+            "backing":            best_team,
+            "side":               best_side,
+            "polymarket_price":   round(best_poly_price, 4),
+            "sharp_prob":         round(best_sharp_prob, 4),
+            "edge_pct":           round(best_edge_pct, 2),
+            "home_edge_pct":      round(home_edge * 100, 2),
+            "away_edge_pct":      round(away_edge * 100, 2),
             "direction_conflict": direction_conflict,
-            "conflict_note":    conflict_note,
+            "conflict_note":      conflict_note,
+            "value_threshold":    value_threshold,
+            "conviction_aligned": conv_aligned and max_conf in ("high", "medium"),
         }
 
         # ── Anomalous edge sanity check ──────────────────────────────────────
-        # Real market edges don't exceed ~15% for NBA/NFL. Anything above is a
-        # contamination signal — most likely a partial-game vs full-game mismatch
-        # that slipped through Max's slug filter (e.g. via fuzzy name matching).
         max_sane = _MAX_SANE_EDGE.get(sport, 15.0)
         if best_edge_pct > max_sane:
             logger.warning(
                 f"[Nova] ANOMALOUS_EDGE — {event_id}: {best_edge_pct:.1f}% exceeds "
                 f"{max_sane:.0f}% sanity limit for {league}. Flagging as contamination."
             )
-            nova_verdict  = "UNKNOWN"
+            nova_verdict   = "UNKNOWN"
             unknown_reason = "anomalous_edge_sanity_check"
             notes = (
                 f"Edge {best_edge_pct:.1f}% exceeds {max_sane:.0f}% sanity limit for {league} — "
@@ -428,12 +463,12 @@ def _compute_analysis(candidate: dict, pm_events: list) -> dict:
         elif best_edge_pct >= 8:
             nova_verdict = "VALUE"
             notes = f"Strong edge: {best_team} at {best_poly_price:.0%} vs sharp {best_sharp_prob:.0%} (+{best_edge_pct:.1f}%)"
-        elif best_edge_pct >= 5:
+        elif best_edge_pct >= value_threshold:
             nova_verdict = "VALUE"
-            notes = f"Edge: {best_team} at {best_poly_price:.0%} vs sharp {best_sharp_prob:.0%} (+{best_edge_pct:.1f}%)"
+            notes = f"Edge: {best_team} at {best_poly_price:.0%} vs sharp {best_sharp_prob:.0%} (+{best_edge_pct:.1f}%){threshold_tag}"
         elif best_edge_pct > 0:
             nova_verdict = "FAIR"
-            notes = f"Edge {best_edge_pct:.1f}% — within noise margin, not enough to bet."
+            notes = f"Edge {best_edge_pct:.1f}% — below {value_threshold:.0f}% threshold."
         else:
             nova_verdict = "OVERPRICED"
             notes = f"Polymarket overprices the favourite. No edge found."
