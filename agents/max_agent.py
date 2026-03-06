@@ -578,9 +578,11 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
             logger.info(f"[Max] Deprioritized {len(nhl)} NHL event(s) to end of research queue (efficiently priced)")
 
         # Hard slot caps per league — enforced in Python, not prompt-dependent.
-        # NBA/NHL are efficiently priced; cap their slots so non-NBA markets
-        # always dominate the prompt even on heavy NBA schedule days.
-        _LEAGUE_SLOT_CAPS = {"NBA": 2, "NHL": 3}
+        # NBA and NHL are structurally efficient (confirmed across 20 batches: 0-2% edges).
+        # Set to 0 = fully excluded. EPL/UCL/MLB/MMA only.
+        # If no non-NBA/NHL markets are available today, pm_lines will be empty
+        # and the pipeline skips the batch rather than waste compute on efficient markets.
+        _LEAGUE_SLOT_CAPS = {"NBA": 0, "NHL": 0}
         _league_counts: dict = {}
 
         # Leagues where Polymarket has NO totals markets — suppress totals_slug display
@@ -630,24 +632,29 @@ def run(sports: list = None, hours_ahead: int = 48, pm_events: list = None) -> d
             pm_lines.append(
                 f'  - [{league}] {teams} | vol=${vol:,.0f} | ends={end}{timing_tag} | slug={e["slug"]}{totals_marker}'
             )
-        nba_shown = _league_counts.get("NBA", 0)
-        nhl_shown = _league_counts.get("NHL", 0)
-        cap_note = ""
-        if nba_shown:
-            cap_note += f" NBA is capped at {nba_shown} slot(s) — efficiently priced, low edge historically."
-        if nhl_shown:
-            cap_note += f" NHL is capped at {nhl_shown} slot(s)."
+        if not pm_lines:
+            logger.warning(
+                "[Max] No eligible markets after league filtering (NBA/NHL excluded). "
+                "No EPL/UCL/MLB/MMA markets available right now — skipping batch."
+            )
+            return {
+                "agent": "Max",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "candidates": [],
+                "note": "No eligible markets (EPL/UCL/MLB/MMA). NBA and NHL excluded as structurally efficient.",
+            }
+
         pm_section = (
             f"ACTIVE POLYMARKET SPORTS MARKETS RIGHT NOW (sorted by volume, highest first):\n"
             + "\n".join(pm_lines)
-            + f"\n\nThese are the ONLY games you may output as candidates.{cap_note} "
+            + "\n\nThese are the ONLY games you may output as candidates. "
             "DO NOT output candidates for any game not listed here — not from web search, "
             "not from your training data, not from historical knowledge. "
             "Markets without a totals_slug have NO Over/Under market on Polymarket — "
             "do NOT produce totals candidates for those events. "
             "Use web search only to research games that ARE on this list."
         )
-        logger.info(f"[Max] Injecting {len(full_game_events)} full-game Polymarket events into prompt")
+        logger.info(f"[Max] Injecting {len(pm_lines)} eligible markets into prompt (NBA/NHL excluded)")
     else:
         pm_section = (
             "NOTE: Could not fetch live Polymarket markets. "

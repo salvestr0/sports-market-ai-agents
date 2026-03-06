@@ -63,14 +63,13 @@ SELF_REVIEW_INTERVAL_S = 4 * 3600   # every 4 hours
 _last_self_review: float = 0.0      # epoch seconds; 0 = never run
 
 SPORTS = [
-    "basketball_nba",
-    "americanfootball_nfl",
     "soccer_epl",
     "soccer_uefa_champs_league",
-    "icehockey_nhl",
     "baseball_mlb",
     "mma_mixed_martial_arts",
 ]
+# NBA and NHL excluded: confirmed structurally efficient across 20 batches (0-2% edges).
+# NFL excluded: off-season. Re-add when season resumes in September.
 
 HOURS_AHEAD = 24  # Sharp books post lines ~12-24h out — research beyond 24h produces UNKNOWN edges
 REPORTS_DIR = "agents/reports"
