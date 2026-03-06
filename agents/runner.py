@@ -71,7 +71,7 @@ SPORTS = [
 # NBA and NHL excluded: confirmed structurally efficient across 20 batches (0-2% edges).
 # NFL excluded: off-season. Re-add when season resumes in September.
 
-HOURS_AHEAD = 72  # Look 72h ahead so weekend EPL/MMA games appear on weekday batches
+HOURS_AHEAD = 48  # 48h: catches weekend games from Friday; Pinnacle lines posted by then
 REPORTS_DIR = "agents/reports"
 SCRAPER_DIR = "scraper_data"
 
