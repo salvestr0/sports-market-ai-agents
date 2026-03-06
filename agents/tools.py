@@ -1399,15 +1399,13 @@ def get_polymarket_market(home_team: str, away_team: str, sport: str = "") -> di
 
 # ─── fetch_polymarket_events ──────────────────────────────────────────────────
 
-# Polymarket tag IDs per sport (from GET /sports endpoint)
+# Polymarket tag IDs per sport (from GET /sports endpoint).
+# NBA/NFL/NHL removed — confirmed structurally efficient, excluded from pipeline.
 _SPORT_TAGS = {
-    "NBA":   "745",
-    "NFL":   "450",
     "EPL":   "82",
-    "NHL":   "899",
+    "UCL":   "306",      # UEFA Champions League
     "MLB":   "100381",
     "MMA":   "100639",   # generic sports tag — catches UFC/boxing/etc.
-    "UCL":   "306",      # UEFA Champions League
 }
 
 
@@ -1613,7 +1611,14 @@ def fetch_polymarket_events(hours_ahead: int = 48) -> list:
                             ou_line = float(m2.group(1))
                     break
 
+            # Reject non-matchup markets: any event where "team" names are
+            # generic outcome words (Yes/No/Over/Under) is a prop or futures
+            # market that slipped through — not a real matchup.
+            _NON_TEAM_WORDS = {"yes", "no", "over", "under", "draw", "other"}
             teams = list(moneyline_prices.keys())
+            if any(t.strip().lower() in _NON_TEAM_WORDS for t in teams):
+                continue
+
             event_dict = {
                 "league":           league,
                 "title":            title,
